@@ -1,0 +1,262 @@
+---
+title: "Batch – analiza biomarkerów: interwencja × czas"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  # Jeżeli TRUE – wykorzysta równoległość (furrr); w przeciwnym razie sekwencyjnie
+  parallel: true
+  # Ścieżka do pliku z danymi
+  data_path: "Dane/2025_07_26_publikacja.xlsx"
+  # Arkusz Excela
+  sheet: 1
+  # Ścieżka do tabeli metadanych zmiennych (opcjonalnie). Jeśli NA – wykryje automatycznie z danych.
+  meta_path: "Dane/meta_auto.xlsx"
+  # Katalog wyjściowy na raporty HTML
+  out_dir: "wyniki_robocze/3gr_2pomiary_framework"
+  # Nazwa podkatalogu na podsumowania CSV
+  summary_dir: "_summary"
+  # Czy wykonywać także alternatywną analizę ANCOVA (koniec ~ grupa + początek)
+  do_ancova: true
+---
+
+> **Cel notebooka**: zautomatyzować uruchamianie raportów dla wielu zmiennych biologicznych/biochemicznych, zebrać wyniki do jednej tabeli, skorygować p‑value metodą FDR (Benjamini–Hochberg) oraz wygenerować stronę indeksową z linkami do raportów jednostkowych.
+>
+> **Najważniejsze zmiany względem poprzedniej wersji**:
+>
+> -   przejście na **afex** (ANOVA z korekcjami GG/HF) oraz **LMM (lmerTest)** – lepsza obsługa braków danych,
+> -   diagnostyka założeń na **resztach modelu**,
+> -   centralne **FDR** dla wszystkich zmiennych,
+> -   **metadane** zmiennych (etykiety, jednostki, transformacje),
+> -   konsekwentne zwracanie wyników jako **tibble** i **zapisy do CSV**.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Pakiety
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(openxlsx)
+library(here)
+library(rmarkdown)
+library(glue)
+library(fs)
+library(purrr)
+library(furrr)        # równoległość
+library(rlang)
+```
+
+## Konfiguracja ścieżek i katalogów
+
+```{r}
+here::i_am("szablony_analiz/anova_rm/3gr_2pomiary/new_version_obliczenia_zbiorcze.Rmd")
+out_dir      <- here::here(params$out_dir)
+summary_dir  <- fs::path(out_dir, params$summary_dir)
+reports_dir  <- fs::path(out_dir, "raporty")
+plots_dir    <- fs::path(out_dir, "plots")
+log_dir      <- fs::path(out_dir, "logs")
+
+fs::dir_create(c(out_dir, summary_dir, reports_dir, plots_dir, log_dir))
+```
+
+## Wczytanie danych surowych
+
+```{r}
+raw <- readxl::read_excel(here::here(params$data_path), sheet = params$sheet) |>
+  janitor::clean_names() |>
+  filter(!is.na(id_osoby))
+
+names(raw)
+```
+
+## Metadane zmiennych
+
+Metadane powinny zawierać kolumny (minimalnie):
+
+-   `nazwa_kolumny` – dokładna nazwa kolumny w danych,
+-   `etykieta` – czytelna nazwa do raportu,
+-   `jednostka` – np. `ng/mL`, `mmol/L`, `kg` itp.,
+-   `transformacja` – np. `none`, `log10`, `loge`,
+-   `domena_dodatnia` – `TRUE` jeśli wartości muszą być \> 0 (ułatwia walidację),
+-   (opcjonalnie) `lod` – granica oznaczalności.
+
+Jeżeli pliku z metadanymi brak, utworzymy szkic automatycznie i zapiszemy go do `meta_auto.xlsx`.
+
+```{r}
+meta_path <- params$meta_path
+if (is.na(meta_path) || !fs::file_exists(here::here(meta_path))) {
+  message("Nie znaleziono metadanych – tworzę szkic na podstawie danych...")
+  numeric_cols <- raw |>
+    select(where(is.numeric)) |>
+    select(-id_pomiaru) |>
+    names()
+  meta <- tibble(
+    nazwa_kolumny = numeric_cols,
+    etykieta = numeric_cols,
+    jednostka = NA_character_,
+    transformacja = "none",
+    domena_dodatnia = TRUE,
+    lod = NA_real_
+  )
+  auto_meta_path <- here::here("Dane", "meta_auto.xlsx")
+  openxlsx::write.xlsx(meta, auto_meta_path, overwrite = TRUE)
+  message("Zapisano szkic metadanych: ", auto_meta_path)
+} else {
+  meta <- readxl::read_excel(here::here(meta_path)) |>
+    janitor::clean_names()
+}
+
+# Prosta funkcja pobierająca metadane dla zmiennej
+get_meta <- function(var) {
+  meta |>
+    filter(nazwa_kolumny == var) |>
+    slice(1)
+}
+```
+
+## Przygotowanie listy zmiennych do analizy
+
+```{r}
+# wszystkie zmienne numeryczne dostępne w danych, które mają metadane
+vars_all <- intersect(names(raw), meta$nazwa_kolumny) |>
+  setdiff(c("id_osoby", "id_pomiaru"))
+
+length(vars_all)
+head(vars_all)
+```
+
+> Możesz ograniczyć analizę np. do podzbioru zmiennych przez `vars_all <- c("blonnik_mcal", "blonnik_mj")`.
+
+## Funkcja renderująca raport dla pojedynczej zmiennej
+
+Każdy raport **zapisze** dodatkowo plik CSV z podsumowaniem (`_summary/<zmienna>.csv`), który później zbierzemy globalnie.
+
+```{r}
+render_one <- function(var){
+  meta_row <- get_meta(var)
+  out_file <- fs::path(reports_dir, paste0(var, ".html"))
+
+  render(
+    input = here::here("szablony_analiz/anova_rm/3gr_2pomiary/new_version_szablon_two_way_interwencja_czas.Rmd"),
+    output_file = out_file,
+    params = list(
+      my_param = var,
+      data_path = params$data_path,
+      sheet = params$sheet,
+      summary_dir = summary_dir,
+      plots_dir = plots_dir,
+      do_ancova = params$do_ancova,
+      meta_row = meta_row
+    ),
+    quiet = TRUE
+  )
+
+  tibble(zmienna = var, plik = out_file)
+}
+```
+
+## Uruchomienie – sekwencyjnie lub równolegle
+
+```{r}
+if (isTRUE(params$parallel)) {
+  plan(multisession)
+  log_path <- fs::path(log_dir, paste0("render_log_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt"))
+  cat("Start renderu: ", as.character(Sys.time()), file = log_path, sep = "\n")
+  results <- future_map_dfr(vars_all, safely(render_one))
+} else {
+  results <- map_dfr(vars_all, ~ render_one(.x)) |> mutate(error = NA)
+}
+```
+
+Jeśli w trybie równoległym wystąpią błędy, pojawią się w kolumnie `result$error`. Można je przejrzeć i ponowić render tylko dla tych zmiennych.
+
+```{r}
+# Rozpakuj listę results, jeżeli użyto safely()
+# if ("result" %in% names(results)) {
+#   ok <- results |>
+#     mutate(zmienna = map_chr(result, ~ .x$zmienna %||% NA_character_),
+#            plik = map_chr(result, ~ .x$plik %||% NA_character_),
+#            error = map_chr(error, ~ if (is.null(.x)) NA_character_ else as.character(.x))) |>
+#     select(zmienna, plik, error)
+# } else {
+#   ok <- results
+# }
+# 
+# ok |> arrange(zmienna) |> head()
+```
+
+## Zbiorcze podsumowanie i FDR
+
+Każdy raport zapisuje `_summary/<zmienna>.csv` z kolumnami: `zmienna`, `p_interakcja`, `p_czas`, `p_interwencja`, `ges_*`, liczebności itd. Zbierzemy te pliki i skorygujemy p‑value metodą BH.
+
+```{r}
+sum_files <- fs::dir_ls(summary_dir, glob = "*.csv")
+all_summaries <- map_dfr(sum_files, readr::read_csv, show_col_types = FALSE)
+
+all_fdr <- all_summaries |>
+  mutate(
+    q_interakcja   = p.adjust(p_interakcja,   method = "BH"),
+    q_czas         = p.adjust(p_czas,         method = "BH"),
+    q_interwencja  = p.adjust(p_interwencja,  method = "BH"),
+    .after = p_interwencja
+  ) |>
+  arrange(q_interakcja, q_czas, q_interwencja)
+
+openxlsx::write.xlsx(all_fdr, fs::path(out_dir, "podsumowanie_FDR.xlsx"), overwrite = TRUE)
+readr::write_csv(all_fdr, fs::path(out_dir, "podsumowanie_FDR.csv"))
+
+all_fdr |> slice_head(n = 20)
+```
+
+## Indeks raportów HTML
+
+Utworzymy prostą stronę z linkami.
+
+```{r}
+index_path <- fs::path(out_dir, "index.html")
+
+index_tbl <- all_fdr |>
+  mutate(
+    raport = fs::path("raporty", paste0(zmienna, ".html")),
+    link = glue('<a href="{raport}">{zmienna}</a>')
+  ) |>
+  select(zmienna, link, starts_with("p_"), starts_with("q_"), starts_with("ges"))
+
+html_table <- knitr::kable(index_tbl, format = "html", table.attr = 'class="table"', escape = FALSE)
+
+html_page <- glue::glue(
+'<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8"/>
+<title>Indeks raportów – interwencja × czas</title>
+<style>body{{font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;margin:2rem;}} table{{border-collapse:collapse;width:100%;}} th,td{{border:1px solid #ddd;padding:8px;}} th{{background:#f5f5f5;}} tr:nth-child(even){{background:#fafafa;}}</style>
+</head>
+<body>
+<h1>Indeks raportów</h1>
+<p>Data generacji: {format(Sys.time(), "%Y-%m-%d %H:%M:%S")}</p>
+{html_table}
+</body>
+</html>')
+
+writeLines(html_page, index_path)
+index_path
+```
+
+## Informacje o sesji
+
+```{r}
+# si_path <- fs::path(out_dir, "sessionInfo.txt")
+# writeLines(capture.output(sessionInfo()), si_path)
+# si_path
+```
+
+------------------------------------------------------------------------

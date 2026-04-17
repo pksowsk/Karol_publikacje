@@ -1,0 +1,240 @@
+---
+title: "Korelacje"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+library(tidyverse)
+library(corrr)
+library(writexl)
+library(fs)
+
+output_dir <- "../../wyniki_robocze/korelacje"
+fs::dir_create(output_dir)
+```
+
+
+
+
+```{r include=F}
+df_raw_1 <- openxlsx::read.xlsx('../../Dane/2025_01_22_publikacja.xlsx', sheet = 1) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(id_osoby))
+
+# df_raw_2 <- openxlsx::read.xlsx('../../Dane/2023_10_29_publikacje_dieta.xlsx', sheet = 2) %>% 
+#   janitor::clean_names() %>% 
+#   filter(!is.na(id_osoby))
+
+
+
+
+df_1 <- df_raw_1 %>% 
+  mutate(
+    czas = case_when(
+      id_pomiaru %in% c(0, 2, 4) ~ "początek",
+      id_pomiaru %in% c(1, 3, 5) ~ "koniec"
+      ),
+    .before = id_osoby) %>%  
+  mutate(
+    interwencja = case_when(
+      id_pomiaru %in% c(0, 1) ~ "trening",
+      id_pomiaru %in% c(2, 3) ~ "trening_dieta",
+      id_pomiaru %in% c(4, 5) ~ "grupa_kontrolna"
+      ),
+    .before = id_osoby) %>%
+  mutate(
+    id_osoby = paste0(id_osoby, "_", interwencja),
+    id = paste0(id_osoby, "_", id_pomiaru),
+    .before = czas) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(czas = fct_relevel(czas, c("początek", "koniec")))
+
+
+```
+
+# Zwykła korelacje
+
+```{r echo=FALSE}
+corr_mat_1 <- df_1 %>% 
+  filter(interwencja == "trening") %>% 
+  dplyr::select(-c(id_pomiaru:id)) %>% 
+  correlate() %>% 
+  mutate(across(-term, ~round(., 2)))
+
+corr_mat_1
+```
+
+
+```{r echo=FALSE}
+corr_mat_2 <- df_1 %>% 
+  filter(interwencja == "trening_dieta") %>% 
+  dplyr::select(-c(id_pomiaru:id)) %>% 
+  correlate() %>% 
+  mutate(across(-term, ~round(., 2)))
+
+
+corr_mat_2
+```
+
+```{r}
+corr_mat_3 <- df_1 %>% 
+  filter(interwencja == "grupa_kontrolna") %>% 
+  dplyr::select(-c(id_pomiaru:id)) %>% 
+  correlate() %>% 
+  mutate(across(-term, ~round(., 2)))
+
+corr_mat_3
+```
+
+
+
+```{r}
+corr_mat_1 %>% 
+  write_csv(fs::path(output_dir, "cor_mat_trening.csv"))
+
+corr_mat_2 %>% 
+  write_csv(fs::path(output_dir, "cor_mat_trening_dieta.csv"))
+
+corr_mat_3 %>% 
+  write_csv(fs::path(output_dir, "cor_mat_grupa_kontrolna.csv"))
+```
+
+
+
+
+```{r}
+
+df_1 %>% 
+  filter(interwencja == "trening") %>%
+  select(id_osoby, czas, irisyna_ng_ml) %>% 
+  pivot_wider(names_from = czas, values_from = irisyna_ng_ml) %>% 
+  na.omit() %>% 
+  correlate()
+
+```
+
+
+```{r}
+df_1 %>% 
+  filter(interwencja == "grupa_kontrolna") %>%
+  select(id_osoby, czas, irisyna_ng_ml) %>% 
+  pivot_wider(names_from = czas, values_from = irisyna_ng_ml) %>% 
+  na.omit() %>% 
+  correlate()
+
+```
+
+
+```{r}
+df_1 %>% 
+  filter(interwencja == "trening_dieta") %>%
+  select(id_osoby, czas, irisyna_ng_ml) %>% 
+  pivot_wider(names_from = czas, values_from = irisyna_ng_ml) %>% 
+  na.omit() %>% 
+  correlate()
+
+```
+
+
+```{r}
+df_cor <- df_1 %>% 
+  filter(interwencja == "trening") %>%
+  select(id_osoby, czas, irisyna_ng_ml) %>% 
+  pivot_wider(names_from = czas, values_from = irisyna_ng_ml) %>% 
+  bind_rows(
+    df_1 %>% 
+      filter(interwencja == "trening_dieta") %>%
+      select(id_osoby, czas, irisyna_ng_ml) %>% 
+      pivot_wider(names_from = czas, values_from = irisyna_ng_ml)
+  ) %>%
+  bind_rows(
+    df_1 %>% 
+      filter(interwencja == "grupa_kontrolna") %>%
+      select(id_osoby, czas, irisyna_ng_ml) %>% 
+      pivot_wider(names_from = czas, values_from = irisyna_ng_ml)
+  ) %>% 
+  bind_rows(
+    df_1 %>% 
+      filter(interwencja == "trening") %>%
+      select(id_osoby, czas, il_6_pg_ml) %>% 
+      pivot_wider(names_from = czas, values_from = il_6_pg_ml)
+  ) %>% 
+  na.omit()
+
+df_cor %>% 
+  correlate()
+
+```
+
+
+# Korelacje na różnicach 
+
+
+## Grupa trening
+
+```{r}
+df_1 %>% 
+  filter(interwencja == "trening") %>%
+  select(id_osoby, czas, irisyna_ng_ml) %>% 
+  pivot_wider(names_from = czas, values_from = irisyna_ng_ml) %>% 
+  mutate(różnica = koniec - początek) %>% 
+  correlate()
+
+```
+
+
+
+```{r}
+korelacja_dla_grupy <- function(df, int) {
+  df %>% 
+    filter(interwencja == int) %>% 
+  select(-c(id_pomiaru:id, interwencja, nazwisko, imie)) %>%
+  pivot_longer(where(is.numeric), names_to = "parametr", values_to = "value") %>%
+  pivot_wider(id_cols = , names_from = czas, values_from = value) %>% 
+  mutate(zmiana = koniec - początek) %>%
+  select(-c(początek, koniec)) %>%
+  pivot_wider(names_from = parametr, values_from = zmiana) %>% 
+  correlate() %>% 
+  mutate(across(-term, ~round(., 3)))
+}
+```
+
+
+```{r}
+int <- "trening"
+
+(trening_kor <- df_1 %>% 
+  korelacja_dla_grupy(int))
+
+```
+
+
+```{r}
+int <- "trening_dieta"
+
+(trening_dieta_kor <- df_1 %>% 
+  korelacja_dla_grupy(int))
+```
+
+```{r}
+int <- "grupa_kontrolna"
+
+(kontrolna_kor <- df_1 %>% 
+  korelacja_dla_grupy(int))
+```
+
+```{r}
+df_list <- list(
+  trening = trening_kor,
+  trening_dieta = trening_dieta_kor,
+  grupa_kontrolna = kontrolna_kor
+)
+
+# Zapisywanie do pliku .xlsx
+write_xlsx(df_list, path = fs::path(output_dir, "zmiany_korelacje.xlsx"))
+
+# getwd()
+```

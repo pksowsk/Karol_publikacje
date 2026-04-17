@@ -1,0 +1,707 @@
+---
+title: "Regresja wieloraka – tidymodels dla *adiponektyna\_ng\_ml*"
+author: "Notebook roboczy"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  data_path: "Dane/2025_07_26_publikacja.xlsx"
+  sheet: 1
+  target: "adiponektyna_ng_ml"
+  # target: "crp_mg_l"
+  # strategia danych: "baseline" (domyślna), "mean\_by\_id", "mixed"
+  strategy: "mixed"
+  # wyklucz zmienne z puli predyktorów (ID, czasowe, outcome'y o tej samej etiologii itp.)
+  exclude: !r c("id_osoby", "id_pomiaru", "nazwisko", "imie")
+  # liczba foldów CV (grupowanych po id\_osoby, jeśli dostępne)
+  vfolds: 10
+  repeats: 1
+  # czy zapisać wykresy do plików
+  save_plots: true
+  plots_dir: "wyniki_robocze/regresja/plots_reg"
+---
+
+> **Cel:** Zbudowanie i porównanie modeli regresji dla zmiennej zależnej **`r params$target`** z wykorzystaniem frameworku **tidymodels**: OLS (`lm`) oraz modeli regularizowanych **ridge/lasso/elastic net** (`glmnet`). Dodatkowo pokazujemy wariant **modelu mieszanego** (random intercept dla `id_osoby`) z użyciem `parsnip` + `multilevelmod` (sekcja opcjonalna). Zastosowano **grupowane CV** po osobach, aby uniknąć wycieku informacji w danych z powtórzeniami.
+
+---
+
+## 1. Pakiety
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(here)
+
+# tidymodels core
+library(tidymodels)
+library(rsample)
+library(parsnip)
+library(workflows)
+library(tune)
+library(broom)
+library(dials)
+library(yardstick)
+
+# mixed models in tidymodels
+library(multilevelmod)   # rozszerzenie parsnip dla lmer
+
+# diagnostyka i ważność zmiennych
+library(vip)
+library(performance)
+library(broom.mixed)
+
+# pomocnicze
+library(glue)
+library(fs)
+```
+
+```{r}
+tidymodels_prefer()  # preferuj funkcje z tidymodels, gdy są konflikty nazw
+```
+
+## 2. Wczytanie danych i konstrukcja cech
+
+```{r}
+here::i_am("szablony_analiz/regresja/regresja_new.Rmd")
+raw <- readxl::read_excel(here::here(params$data_path), sheet = params$sheet) %>%
+  janitor::clean_names() %>%
+  filter(!is.na(id_osoby))
+
+names(raw)
+```
+
+### 2.1. Czas i interwencja
+
+```{r}
+df0 <- raw %>%
+  mutate(
+    czas = case_when(
+      id_pomiaru %in% c(0, 2, 4) ~ "początek",
+      id_pomiaru %in% c(1, 3, 5) ~ "koniec",
+      TRUE ~ NA_character_
+    ),
+    interwencja = case_when(
+      id_pomiaru %in% c(0, 1) ~ "trening",
+      id_pomiaru %in% c(2, 3) ~ "trening_dieta",
+      id_pomiaru %in% c(4, 5) ~ "grupa_kontrolna",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  mutate(
+    czas = factor(czas, levels = c("początek","koniec")),
+    interwencja = factor(interwencja, levels = c("trening","trening_dieta","grupa_kontrolna")),
+    id_osoby = paste0(id_osoby, "_", interwencja)
+  ) |>
+  mutate_if(is.character, factor)
+```
+
+### 2.2. Wybór strategii danych
+
+* **`baseline` (domyślna)** – używamy wyłącznie pomiarów **„początek”** (unikamy wpływu interwencji/czasu i powtórzeń; jeden wiersz na osobę).
+* **`mean_by_id`** – uśredniamy po `id_osoby` (redukcja szumu kosztem utraty dynamiki).
+* **`mixed`** – zostawiamy pełne dane i później dopasowujemy **model mieszany** z efektem losowym `(1|id_osoby)` (sekcja 7).
+
+```{r}
+# strategy <- params$strategy
+# stopifnot(strategy %in% c("baseline","mean_by_id","mixed"))
+# 
+# if (strategy == "baseline") {
+#   df_model <- df0 %>% filter(czas == "początek")
+# } else if (strategy == "mean_by_id") {
+#   df_model <- df0 %>%
+#     group_by(id_osoby) %>%
+#     summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+#     left_join(df0 %>% select(id_osoby, interwencja) %>% distinct(), by = "id_osoby")
+# } else { # mixed
+#   df_model <- df0
+# }
+# 
+# Cel i pula predyktorów
+target <- params$target
+# 
+# stopifnot(target %in% names(df_model))
+
+# pred_all <- df_model %>%
+#   select(where(is.numeric), where(is.factor)) %>%
+#   select(-all_of(c(params$exclude, target))) %>%
+#   names()
+# 
+# pred_all
+```
+
+```{r}
+df_model <- df0 %>% 
+  select(-c(id_pomiaru, id_osoby, nazwisko, imie))
+
+df_model
+```
+
+> **Uwaga:** Jeśli część predyktorów jest wynikiem z tego samego panelu biomarkerów co zmienna docelowa, rozważ ograniczenie puli (ryzyko współzależności biologicznej i kolinearności). Możesz doprecyzować `params$exclude`.
+
+## 3. Podział danych i resampling
+
+### wersja prosta
+
+```{r}
+set.seed(123)
+split <- initial_split(df_model, strata = interwencja, prop = 4/5)
+
+
+train_data <- training(split)
+test_data  <- testing(split)
+```
+
+```{r}
+# Define the linear regression model specification
+lm_model_spec <- linear_reg() %>%
+  set_engine("lm") %>%       # Use the 'lm' engine (from base R stats package)
+  set_mode("regression")   # Specify the mode as regression
+
+# Print the model specification
+lm_model_spec
+```
+
+
+```{r}
+
+selected_cols <- c(target, "dexa_ffm_kg_bm", "fgi", "wskaznik_aterogenezy_cri_ii")
+
+train_data <- train_data %>%
+  select(selected_cols)
+
+test_data <- test_data %>%
+  select(selected_cols)
+
+rec <- recipe(
+  adiponektyna_ng_ml ~ ., data = train_data) %>%
+  # update_role(id_osoby, new_role = "group_id") %>%
+  step_rm(all_outcomes(), -all_of(target)) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_lincomb(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+prep(rec)
+```
+
+
+```{r}
+bake(prep(rec), new_data = train_data)  # sprawdź, czy recipe się przygotowuje
+```
+
+
+
+```{r}
+lm_wf <- workflow() %>% 
+  add_model(lm_model_spec) %>%
+  add_recipe(rec)
+
+lm_wf
+```
+
+
+```{r}
+final_fit <- lm_wf %>%
+  last_fit(split = split)
+
+# Print the results
+final_fit
+```
+
+
+
+```{r}
+final_workflow_fit <- extract_workflow(final_fit)
+
+final_model_fit <- extract_fit_parsnip(final_workflow_fit)
+
+
+summary(final_model_fit$fit)
+```
+
+
+```{r}
+par(mfrow = c(2, 2))
+
+# Generate standard diagnostic plots for the lm object
+plot(
+  final_model_fit$fit,
+  pch = 16,
+  col = '#006EA1',
+  id.n = 3 # Number of extreme points to label
+)
+
+# Reset plotting area to default
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+# Collect performance metrics on the test set
+final_metrics <- final_fit %>%
+  collect_metrics()
+
+final_metrics
+```
+
+
+
+```{r}
+
+# Collect predictions on the test set
+final_predictions <- final_fit %>%
+  collect_predictions()
+
+final_predictions
+```
+
+
+```{r}
+final_predictions %>%
+  ggplot(aes(x = .pred, y = adiponektyna_ng_ml)) +
+  geom_point(color = '#006EA1', alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, color = 'orange', linetype = "dashed", linewidth = 1) +
+  labs(
+    title = 'Actual vs. Predicted',
+    subtitle = 'Test Set Results',
+    x = 'Predicted',
+    y = 'Actual'
+  ) +
+  theme_minimal() +
+  coord_fixed()
+```
+
+
+
+
+
+
+
+
+### wersja rozbudowana
+
+Używamy **grupowanego podziału** i **grupowanego CV** po `id_osoby`, żeby zapobiec wyciekowi informacji między foldami przy danych z powtórzeniami.
+
+```{r}
+set.seed(123)
+
+if (strategy == "mixed") {
+  split <- rsample::group_initial_split(df_model, group = id_osoby, prop = 3/4)
+  folds <- rsample::group_vfold_cv(training(split), group = id_osoby, v = params$vfolds, repeats = params$repeats)
+} else {
+  split <- rsample::initial_split(df_model, prop = 3/4, strata = !!sym(target))
+  folds <- rsample::vfold_cv(training(split), v = params$vfolds, repeats = params$repeats, strata = !!sym(target))
+}
+
+train_data <- training(split)
+test_data  <- testing(split)
+
+nrow(train_data); nrow(test_data)
+```
+
+## 4. Recipe – przygotowanie cech
+
+* imputacja braków: **medianowa** dla numerycznych, **tryb** dla kategorycznych,
+* transformacja **Yeo–Johnson** (działa także na wartości ≤ 0),
+* usuwanie cech stałych i liniowych kombinacji,
+* redukcja kolinearności: usuwamy cechy o |r| > 0.9,
+* standaryzacja numerycznych,
+* dummifikacja czynników.
+
+```{r}
+rec <- recipe(formula(glue("{target} ~ .")), data = train_data) %>%
+  # update_role(id_osoby, new_role = "group_id") %>%
+  step_rm(all_outcomes(), -all_of(target)) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_lincomb(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+prep(rec)  # sprawdź, czy recipe się przygotowuje
+```
+
+## 5. Specyfikacje modeli
+
+### 5.1. OLS (lm)
+
+```{r}
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+```
+
+### 5.2. Ridge / Lasso / Elastic Net (glmnet)
+
+```{r}
+ridge_spec <- linear_reg(penalty = tune(), mixture = 0) %>% set_engine("glmnet")
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet")
+enet_spec  <- linear_reg(penalty = tune(), mixture = tune()) %>% set_engine("glmnet")
+```
+
+Siatki strojenia:
+
+```{r}
+# typowy zakres kar dla glmnet (log10-lambda od -4 do 1); mieszanka 0..1
+lambda_grid <- grid_regular(penalty(range = c(-4, 1)), levels = 50)  # 50 punktów
+alpha_grid  <- grid_regular(mixture(), levels = 11)
+
+grid_enet <- lambda_grid %>% crossing(alpha_grid)
+```
+
+## 6. Workflows i strojenie
+
+```{r}
+wf_base <- workflow() %>% add_recipe(rec)
+
+wf_lm    <- wf_base %>% add_model(lm_spec)
+wf_ridge <- wf_base %>% add_model(ridge_spec)
+wf_lasso <- wf_base %>% add_model(lasso_spec)
+wf_enet  <- wf_base %>% add_model(enet_spec)
+```
+
+### 6.1. OLS – walidacja krzyżowa
+
+```{r}
+set.seed(123)
+res_lm <- fit_resamples(
+  wf_lm, resamples = folds,
+  metrics = metric_set(yardstick::rmse, rsq, yardstick::mae),
+  control = control_resamples(save_pred = TRUE)
+)
+collect_metrics(res_lm)
+```
+
+### 6.2. Ridge/Lasso – strojenie `penalty`
+
+```{r}
+set.seed(123)
+res_ridge <- tune_grid(
+  wf_ridge, resamples = folds, grid = lambda_grid,
+  metrics = metric_set(yardstick::rmse, rsq, yardstick::mae),
+  control = control_grid(save_pred = TRUE)
+)
+set.seed(123)
+res_lasso <- tune_grid(
+  wf_lasso, resamples = folds, grid = lambda_grid,
+  metrics = metric_set(yardstick::rmse, rsq, yardstick::mae),
+  control = control_grid(save_pred = TRUE)
+)
+```
+
+### 6.3. Elastic Net – strojenie `penalty` × `mixture`
+
+```{r}
+set.seed(123)
+res_enet <- tune_grid(
+  wf_enet, resamples = folds, grid = grid_enet,
+  metrics = metric_set(yardstick::rmse, rsq, yardstick::mae),
+  control = control_grid(save_pred = TRUE)
+)
+```
+
+## 7. Ranking modeli (CV)
+
+```{r}
+rank_tbl <- bind_rows(
+  collect_metrics(res_lm)    %>% mutate(model = "lm"),
+  collect_metrics(res_ridge) %>% mutate(model = "ridge"),
+  collect_metrics(res_lasso) %>% mutate(model = "lasso"),
+  collect_metrics(res_enet)  %>% mutate(model = "enet")
+) %>%
+  filter(.metric %in% c("rmse","rsq","mae")) %>%
+  group_by(model, .metric) %>%
+  slice_min(mean, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(model, .metric, mean, std_err, dplyr::everything())
+
+rank_tbl
+```
+
+```{r}
+# wybór najlepszego po RMSE (niższy lepszy)
+best_rmse <- rank_tbl %>% filter(.metric == "rmse") %>% arrange(mean) %>% slice(1)
+best_model <- best_rmse$model
+best_model
+```
+
+### 7.1. Dynamiczna interpretacja skuteczności CV
+
+```{r}
+rmse_lm   <- rank_tbl %>% filter(model == "lm", .metric == "rmse") %>% pull(mean)
+rmse_best <- best_rmse$mean
+improv    <- (rmse_lm - rmse_best) / rmse_lm
+
+cat(glue::glue(
+  "Najlepszy model wg RMSE: **{best_model}**.\n",
+  "RMSE(lm) = {round(rmse_lm,3)}, RMSE(best) = {round(rmse_best,3)}; ",
+  "relatywna poprawa ≈ {scales::percent(improv, accuracy = 0.1)}."
+))
+```
+
+## 8. Finalizacja i ocena na zbiorze testowym
+
+Dla najlepszego modelu dopasujemy pełny workflow na **train** i ocenimy na **test**.
+
+```{r}
+final_fit <- NULL
+final_wf  <- NULL
+
+if (best_model == "lm") {
+  final_wf  <- wf_lm
+  final_fit <- fit(final_wf, data = train_data)
+} else if (best_model == "ridge") {
+  best_pen <- select_best(res_ridge, metric = "rmse")
+  final_wf <- finalize_workflow(wf_ridge, best_pen)
+  final_fit <- fit(final_wf, data = train_data)
+} else if (best_model == "lasso") {
+  best_pen <- select_best(res_lasso, metric = "rmse")
+  final_wf <- finalize_workflow(wf_lasso, best_pen)
+  final_fit <- fit(final_wf, data = train_data)
+} else if (best_model == "enet") {
+  best_par <- select_best(res_enet, metric = "rmse")
+  final_wf <- finalize_workflow(wf_enet, best_par)
+  final_fit <- fit(final_wf, data = train_data)
+}
+
+final_wf
+```
+
+### 8.1. Jakość na teście
+
+```{r}
+final_res <- predict(final_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(!!sym(target))) %>%
+  rename(.pred = .pred, .obs = !!sym(target))
+
+metrics(final_res, truth = .obs, estimate = .pred) %>% arrange(.metric)
+```
+
+### 8.2. Wykres: obserwowane vs przewidywane
+
+```{r, fig.height=4}
+plt_fit <- ggplot(final_res, aes(x = .obs, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  coord_equal() +
+  theme_classic() +
+  labs(x = "Rzeczywiste", y = "Przewidywane", title = glue("{target}: obserwowane vs prognoza"))
+plt_fit
+
+
+if (isTRUE(params$save_plots)) {
+  fs::dir_create(params$plots_dir)
+  ggsave(fs::path(params$plots_dir, glue("{target}_obs_vs_pred.png")), plt_fit, width = 6, height = 4, dpi = 300)
+}
+```
+
+## 9. Ważność zmiennych i współczynniki
+
+### 9.1. OLS – współczynniki, p‑value i FDR
+
+```{r}
+if (best_model == "lm") {
+  lm_fit <- extract_fit_engine(final_fit)
+  coefs <- broom::tidy(lm_fit) %>% filter(term != "(Intercept)") %>%
+    mutate(p_adj_bh = p.adjust(p.value, method = "BH")) %>%
+    arrange(p_adj_bh)
+  coefs
+
+  # VIF (kolinearność)
+  vif_tbl <- performance::check_collinearity(lm_fit) %>% as_tibble() %>%
+    select(term, VIF, starts_with("CI")) %>% arrange(desc(VIF))
+  vif_tbl
+}
+```
+
+> **Interpretacja:**
+>
+> * Współczynniki dodatnie zwiększają poziom *adiponektyny* wraz ze wzrostem predyktora (przy pozostałych stałych), ujemne – obniżają.
+> * Kolumna `p_adj_bh` to p‑value skorygowane metodą **Benjamini–Hochberg** (FDR). Wybieraj predyktory z `p_adj_bh < 0.05` jako istotne po korekcji, pamiętając o kontekście biologicznym.
+> * `VIF > ~5–10` sugeruje problem kolinearności – rozważ usunięcie/połączenie takich zmiennych lub użycie modelu regularizowanego.
+
+### 9.2. Modele glmnet – liczba aktywnych cech i VIP
+
+```{r}
+if (best_model %in% c("ridge","lasso","enet")) {
+  eng <- extract_fit_engine(final_fit)
+  # parametry najlepszego modelu
+  best_params <- tryCatch({ extract_parameter_set_dials(final_fit) }, error = function(e) NULL)
+  best_params
+
+  # liczba niezerowych współczynników przy dopasowanej lambdzie
+  if (inherits(eng, "glmnet")) {
+    lam <- eng$lambda
+    beta <- as.matrix(coef(eng, s = lam))
+    n_nonzero <- sum(beta[-1,1] != 0)  # bez interceptu
+    cat(glue::glue("Liczba aktywnych (niezerowych) predyktorów: {n_nonzero}.\n"))
+  }
+
+  # VIP
+  vip_plot <- vip::vip(final_fit, num_features = 25)
+  vip_plot
+  if (isTRUE(params$save_plots)) {
+    ggsave(fs::path(params$plots_dir, glue("{target}_vip.png")), vip_plot, width = 7, height = 5, dpi = 300)
+  }
+}
+```
+
+> **Uwaga:**
+>
+> * **LASSO** (mixture = 1) dokonuje selekcji cech – współczynniki części predyktorów stają się dokładnie 0.
+> * **Ridge** (mixture = 0) nie zeruje współczynników, ale silnie je kurczy – dobre przy kolinearności.
+> * **Elastic Net** łączy oba mechanizmy; tuning `mixture` decyduje o proporcji lasso/ridge.
+
+## 10. Diagnostyka modelu końcowego
+
+```{r}
+# Reszty na zbiorze testowym
+resid_tbl <- final_res %>% mutate(resid = .obs - .pred)
+
+p1 <- ggplot(resid_tbl, aes(x = .pred, y = resid)) +
+  geom_point(alpha = 0.6) + theme_classic() +
+  labs(x = "Przewidywane", y = "Reszty", title = "Reszty vs przewidywane")
+
+p2 <- ggplot(resid_tbl, aes(sample = resid)) +
+  stat_qq(alpha = 0.6) + stat_qq_line() + theme_classic() +
+  labs(title = "QQ-plot reszt")
+
+p1; p2
+
+if (isTRUE(params$save_plots)) {
+  ggsave(fs::path(params$plots_dir, glue("{target}_res_vs_pred.png")), p1, width = 6, height = 4, dpi = 300)
+  ggsave(fs::path(params$plots_dir, glue("{target}_qq.png")), p2, width = 6, height = 4, dpi = 300)
+}
+```
+
+```{r}
+# Test Shapiro–Wilka reszt (na teście)
+sh <- shapiro.test(resid_tbl$resid)
+sh
+```
+
+> **Komentarz:** drobne odchylenia od normalności reszt są zwykle akceptowalne. W przypadku silnych naruszeń rozważ transformację zmiennej zależnej lub model odporny.
+
+## 11. (Opcjonalnie) Model mieszany w tidymodels (random intercept dla `id_osoby`)
+
+Ta sekcja wykorzystuje **parsnip** + **multilevelmod** i silnik `lmer` do estymacji regresji liniowej z efektem losowym.
+
+> **Zastosowanie:** gdy mamy wiele wierszy na osobę (powtórzenia), a chcemy wykorzystać całą informację, modelując korelację wewnątrzosobniczą.
+
+```{r}
+if (strategy == "mixed") {
+  # Prosty model: wszystkie predyktory + (1|id_osoby)
+  lmer_spec <- linear_reg() %>% set_engine("lmer")
+  wf_lmer <- workflow() %>%
+    add_model(lmer_spec) %>%
+    add_formula(formula(glue("{target} ~ (1|id_osoby) + {paste(pred_all, collapse = ' + ')}")))
+
+  set.seed(123)
+  res_lmer <- fit_resamples(
+    wf_lmer, resamples = folds, metrics = metric_set(yardstick::rmse, rsq, yardstick::mae),
+    control = control_resamples(save_pred = TRUE)
+  )
+  collect_metrics(res_lmer)
+
+  # Dopasowanie finalne na całym train i ocena na teście
+  fit_lmer_final <- fit(wf_lmer, data = train_data)
+  pred_lmer <- predict(fit_lmer_final, new_data = test_data) %>%
+    bind_cols(test_data %>% select(!!sym(target))) %>% rename(.pred = .pred, .obs = !!sym(target))
+  metrics(pred_lmer, truth = .obs, estimate = .pred)
+
+  # Najistotniejsze współczynniki stałe
+  broom.mixed::tidy(extract_fit_engine(fit_lmer_final), effects = "fixed") %>% arrange(p.value) %>% head(20)
+}
+```
+
+> **Interpretacja:** współczynniki stałe mówią o średnim wpływie predyktorów, natomiast wariancja efektu losowego odpowiada zróżnicowaniu poziomu bazowego między osobami. Gdy wyniki mieszanych i klasycznych modeli różnią się, priorytet ma interpretacja **modelu mieszanego** w przypadku danych z powtórzeniami.
+
+## 12. Podsumowanie narracyjne
+
+```{r}
+# kluczowe liczby
+m_cv <- rank_tbl %>% filter(.metric == "rmse") %>% arrange(mean)
+rmse_best <- m_cv$mean[1]; rsq_best <- (rank_tbl %>% filter(model == m_cv$model[1], .metric == "rsq"))$mean[1]
+model_name <- m_cv$model[1]
+
+rmse_test <- metrics(final_res, truth = .obs, estimate = .pred) %>% filter(.metric == "rmse") %>% pull(.estimate)
+rsq_test  <- metrics(final_res, truth = .obs, estimate = .pred) %>% filter(.metric == "rsq") %>% pull(.estimate)
+
+cat(glue::glue(
+  "**Najlepszy model (CV)**: {model_name}. Średni RMSE_CV = {round(rmse_best,3)}, R^2_CV = {round(rsq_best,3)}.\n",
+  "**Jakość na teście**: RMSE_test = {round(rmse_test,3)}, R^2_test = {round(rsq_test,3)}.\n"
+))
+
+if (best_model == "lm") {
+  sig_terms <- coefs %>% filter(p_adj_bh < 0.05) %>% pull(term)
+  if (length(sig_terms) == 0) {
+    cat("Po korekcji BH brak predyktorów istotnych na poziomie q<0.05. Rozważ model regularizowany lub mniejszy zestaw predyktorów.\n")
+  } else {
+    cat(glue::glue("Istotne predyktory po FDR: {paste(sig_terms, collapse=', ')}.\n"))
+  }
+}
+
+if (best_model %in% c("lasso","enet")) {
+  if (exists("n_nonzero")) {
+    cat(glue::glue("Model wybrał {n_nonzero} predyktorów z całej puli (inne ścięte do zera).\n"))
+  }
+}
+
+if (exists("vif_tbl")) {
+  max_vif <- max(vif_tbl$VIF, na.rm = TRUE)
+  if (is.finite(max_vif) && max_vif > 10) {
+    cat("Wysokie VIF (>10) sugerują silną kolinearność – ridge/enet będą stabilniejsze niż OLS.\n")
+  }
+}
+
+if (exists("sh")) {
+  if (sh$p.value < 0.05) {
+    cat("Reszty na teście odbiegają od normalności (Shapiro p<0.05) – wyniki modeli regularizowanych są zwykle odporne; rozważ transformację celu lub kwantylowe metryki błędu.\n")
+  } else {
+    cat("Normalność reszt nie została odrzucona (Shapiro p>=0.05).\n")
+  }
+}
+```
+
+## 13. Zapis najważniejszych wyników
+
+```{r}
+res_summary <- tibble(
+  target = target,
+  strategy = strategy,
+  best_model = best_model,
+  rmse_cv = rmse_best,
+  rsq_cv = rsq_best,
+  rmse_test = rmse_test,
+  rsq_test = rsq_test,
+  timestamp = Sys.time()
+)
+
+fs::dir_create(params$plots_dir)
+fs::dir_create("wyniki_robocze/regresja")
+readr::write_csv(
+  res_summary,
+  fs::path("wyniki_robocze/regresja", glue("reg_summary_{target}.csv"))
+)
+res_summary
+```
+
+---
+
+### Notatki metodologiczne
+
+* **grouped CV / split**: gdy mamy wiele rekordów na osobę, stosujemy `group_initial_split()` i `group_vfold_cv()` tak, aby te same osoby nie trafiały jednocześnie do trenowania i walidacji.
+* **glmnet**: parametry `penalty` ($\lambda$) i `mixture` ($\alpha$) sterują siłą i rodzajem regularyzacji (`mixture=0` – ridge, `1` – lasso, wartości pomiędzy – elastic net). Wysoka $\lambda$ mocniej kurczy współczynniki i redukuje wariancję kosztem biasu.
+* **FDR (BH)**: przy wielu predyktorach p‑value z OLS korygujemy metodą Benjamini–Hochberg. W modelach `glmnet` selekcja jest elementem estymacji; interpretuj znaczenie predyktorów przez **VIP** i znaki współczynników po dopasowaniu finalnym.
+* **Mieszane**: przy `strategy = "mixed"` używamy `linear_reg(engine = "lmer")` z `(1|id_osoby)`. W workflow przekazujemy **formułę**, a nie recipe (random effects definiujemy w formule).

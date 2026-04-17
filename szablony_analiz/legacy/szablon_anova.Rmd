@@ -1,0 +1,682 @@
+---
+title: "android_bh"
+output:
+   html_document:
+    df_print: paged
+---
+
+### Analizowany parametr
+```{r}
+var = "android_bh"
+```
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+```
+
+
+
+```{r warning=F, include=F}
+library(tidyverse)
+library(psych)
+library(report)
+library(ggridges)
+library(ggthemes)
+library(viridis)
+# library(grubasyKarola)
+library(corrr)
+library(FSA)
+
+```
+
+
+```{r include=F}
+df_raw <- openxlsx::read.xlsx('../../Dane/2023-09-03 obrona.xlsx') %>% 
+  janitor::clean_names()
+
+
+df <- df_raw %>% 
+  mutate(grupa = case_when(
+    str_detect(id_osoby, "B") ~ "badana_1",
+    str_detect(id_osoby, "Z") ~ "badana_2",
+    TRUE ~ "kontrolna"
+    ),
+         .before = id_osoby) %>%  
+  mutate(grupa = factor(grupa),
+         id_osoby = factor(id_osoby),
+         id_pomiaru = factor(id_pomiaru),
+         nazwisko = factor(nazwisko)) 
+
+
+ # df %>% 
+ #   group_by(grupa, id_pomiaru) %>% 
+ #   summarize(n = n())
+
+# skimr::skim(df)
+
+# df %>%
+# colnames()
+
+
+# df %>% 
+  # select(grupa, id_osoby, nazwisko, id_pomiaru, quicki)
+```
+
+
+
+```{r include=F}
+sw_test <- function(tbl, var, gr, pomiar, grupa = grupa){
+  
+  tbl %>% 
+    select({{grupa}}, id_pomiaru, {{var}}) %>% 
+    na.omit() %>% 
+    filter({{grupa}} == gr,
+           id_pomiaru == pomiar) %>% 
+    pull() %>% 
+    shapiro.test()
+}
+
+
+# tbl - df z danymi
+# pomiar - numer pomiaru
+# nazwa - nazwa zmiennej
+
+t_test <- function(tbl, nazwa, pomiar){
+  
+  temp_df <- tbl %>% 
+    select(grupa, id_pomiaru, nazwa) %>% 
+    na.omit() %>% 
+    filter(id_pomiaru == pomiar) 
+  
+  t.test(temp_df %>% 
+           pull(nazwa) ~ temp_df$grupa)
+}
+
+
+# tbl - df z danymi
+# pomiar1 - numer 1 pomiaru
+# pomiar2 - numer 2 pomiaru
+# gr - grupa (badawcza, albo kontrolna)
+# nazwa - nazwa zmiennej
+
+t_test_zal <- function(tbl, pomiar1, pomiar2, gr, nazwa){
+  
+  temp_df <- tbl %>% 
+    select(id_osoby, grupa, id_pomiaru, nazwa) %>% 
+    filter(id_pomiaru %in% c(pomiar1, pomiar2),
+           grupa == gr) %>% 
+    pivot_wider(names_from = id_pomiaru, values_from = nazwa)
+
+  temp_1 <- temp_df %>% 
+    pull(as.character(pomiar1))
+
+  temp_2 <- temp_df %>% 
+    pull(as.character(pomiar2))
+  
+  t.test(temp_1, temp_2, paired = T)
+}
+
+# nazwa - nazwa zmiennej
+stat_opisowa <- function(tbl, nazwa){
+
+  tbl %>% 
+    select(grupa, id_pomiaru, {{nazwa}})  %>% 
+    na.omit() %>% 
+    group_by(grupa, id_pomiaru) %>% 
+    summarize(psych::describe({{nazwa}}, quant = c(.25, 0.5, .75))) 
+}
+
+
+normality_test <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+  filter(grupa %in% grupy,
+         id_pomiaru %in% pomiar)
+
+  for(g in grupy){
+    
+    print(paste("Grupa:", g))
+    
+    res <- sw_test(temp_df, var = var, gr = g, pomiar = pomiar, grupa = grupa)
+    
+    wynik <- if (res$p.value < 0.05) {
+      "Odrzucamy hipotezę o normalności rozkładu"
+    } else {
+      "Nie ma podstaw do odrzucenia hipotezy o normalności rozkładu"
+    }
+    
+    writeLines(paste("Test:", res$method, "\n","Statystyka:", res$statistic, "\n", "p-value", res$p.value, "\n", wynik, "\n"))
+  }
+}
+
+stat_opisowa_testy <- function(df, grupy, pomiar, nazwa){
+  
+  df %>%
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar)  %>%
+    select(grupa, id_pomiaru, {{nazwa}})  %>%
+    na.omit() %>%
+    group_by(grupa, id_pomiaru) %>%
+    summarize(psych::describe({{nazwa}}, quant = c(.25, 0.5,  .75), fast = T)) %>%
+    mutate(across(mean:Q0.75, round, 3)) 
+
+  
+}
+
+
+stat_opisowa_zal <- function(df, grupy, pomiar, nazwa){
+  
+   df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar)  %>% 
+    select(grupa, id_pomiaru, !! sym(nazwa))  %>% 
+    na.omit() %>% 
+    group_by(grupa, id_pomiaru) %>% 
+    summarize(psych::describe(!! sym(nazwa), quant = c(.25, 0.5, .75), fast = T)) %>%
+    mutate(across(mean:Q0.75, round, 3))
+}
+
+
+
+
+
+normality_test_zal <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+  filter(grupa %in% grupy,
+         id_pomiaru %in% pomiar)
+
+  for(p in pomiar){
+    
+    print(paste("Pomiar:", p))
+    
+    res <- sw_test(temp_df, var = var, gr = grupy, pomiar = p, grupa = grupa)
+    
+    wynik <- if (res$p.value < 0.05) {
+      "Odrzucamy hipotezę o normalności rozkładu"
+    } else {
+      "Nie ma podstaw do odrzucenia hipotezy o normalności rozkładu"
+    }
+    
+    writeLines(paste("Test:", res$method, "\n","Statystyka:", res$statistic, "\n", "p-value", res$p.value, "\n", wynik, "\n"))
+  }
+}
+
+
+kruskal_wallis_test <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(grupa, zmienna = !! sym(var))
+    
+
+
+  res <- kruskal.test(zmienna ~ grupa, temp_df)
+
+  wynik <- if (res$p.value < 0.05) {
+        "Grupy się różnią"
+      } else {
+        "Grupy się nie różnią"
+      }
+  
+  effect <- temp_df %>% rstatix::kruskal_effsize(zmienna ~ grupa)
+  
+  wilcox <- pairwise.wilcox.test(temp_df$zmienna, temp_df$grupa, p.adjust.method = "BH")
+  
+  writeLines(paste("Test:", res$method, "\n","Statystyka:", res$statistic, "\n", "p-value", res$p.value, "\n\n", wynik, "\n\n","Effect size:", effect$effsize, "\n\n"))
+  
+  print("Wilcoxon test:")
+  wilcox$p.value
+}
+
+anova_test <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(grupa, zmienna = !! sym(var))
+    
+
+
+  res <- temp_df %>% 
+    aov(zmienna ~ grupa, data = .)
+  
+  
+  rep <- res %>% 
+    report::report()
+  
+  print(rep)
+  writeLines("\n\n\n")
+  print("Tukey test")
+  Tukey_test <- multcomp::glht(res, linfct = multcomp::mcp(grupa = "Tukey"))
+
+ summary(Tukey_test)
+}
+
+
+test_friedmana <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(id_pomiaru, id_osoby, nazwisko, zmienna =!! sym(var))
+  
+  mat <- temp_df %>% 
+    pivot_wider(names_from = id_pomiaru, values_from = zmienna) %>% 
+    select(-c(id_osoby, nazwisko)) %>% 
+    as.matrix()
+    
+  res <- friedman.test(mat)
+  
+  c <- unname(res$statistic)
+  a <- dim(mat)[1]
+  b <- dim(mat)[2]
+  effect <- c/(a*(b-1))
+  
+  wynik <- if (res$p.value < 0.05) {
+        "Grupy się różnią"
+      } else {
+        "Grupy się nie różnią"
+      }
+  
+  writeLines(paste("Test:", res$method, "\n","Statystyka:", res$statistic, "\n", "p-value", res$p.value, "\n\n", wynik, "\n\n","Effect size:", effect, "\n\n"))
+}
+
+wilcoxon_zal <- function(df, grupy, pomiar, var){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(id_pomiaru, id_osoby, nazwisko, zmienna =!! sym(var)) %>% 
+    pivot_wider(names_from = id_pomiaru, values_from = zmienna) %>% 
+    na.omit() %>% 
+    pivot_longer(3:last_col(), names_to = "id_pomiaru", values_to = "zmienna")
+  
+  
+  
+  res <- temp_df %>% 
+    rstatix::wilcox_test(zmienna ~ id_pomiaru,paired = TRUE, p.adjust.method = "bonferroni")
+  
+  effect <- temp_df %>% 
+    rstatix::wilcox_effsize(zmienna ~ id_pomiaru,paired = TRUE, p.adjust.method = "bonferroni")
+  
+  print(res)
+  print(effect) 
+  
+}
+
+anova_test_zal <- function(df, grupy, pomiar, var, id_osoby){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(id_pomiaru, id_osoby, zmienna = !! sym(var))
+    
+  res <- temp_df %>% 
+    rstatix::anova_test(dv = zmienna, wid = id_osoby, within = id_pomiaru)
+  
+  anova_table <- rstatix::get_anova_table(res)
+  
+  wynik <- if (res$ANOVA$p < 0.05) {
+        "Grupy się różnią"
+      } else {
+        "Grupy się nie różnią"
+      }
+  
+  effect <- res$ANOVA$ges
+  
+  print(anova_table)
+  
+  writeLines(paste("\n\n",wynik, "\n\n","Effect size", effect, "\n\n"))
+  
+}
+
+pairwise_paired_t_tests <- function(df, grupy, pomiar, var, id_osoby){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(id_pomiaru, id_osoby, zmienna = !! sym(var)) %>% 
+    pivot_wider(names_from = id_pomiaru, values_from = zmienna) %>% 
+    na.omit() %>% 
+    pivot_longer(cols = !id_osoby, names_to = "id_pomiaru", values_to = "zmienna")
+  
+  pwc <- temp_df %>%
+    rstatix::pairwise_t_test(zmienna ~ id_pomiaru, paired = TRUE,
+    p.adjust.method = "bonferroni", detailed = TRUE
+    )
+  
+  cohens <- temp_df %>% 
+  rstatix::cohens_d(zmienna ~ id_pomiaru, paired = TRUE)
+  
+  print(cohens)
+  print(pwc)
+
+}
+```
+
+
+# Analiza pomiędzy grupami
+
+
+
+
+## 1 pomiar
+ 
+Dane
+```{r}
+
+grupy = c("badana_1", "badana_2", "kontrolna")
+pomiar = c(1)
+```
+
+### Test na normalność rozkładu 
+```{r warning=F}
+df %>% 
+  normality_test(grupy, pomiar, var)
+```
+### Statystyka opisowa
+```{r warning=F}
+df %>% 
+  stat_opisowa_testy(grupy, pomiar, !!sym(var)) 
+
+```
+
+### ANOVA
+```{r}
+df %>% 
+  anova_test(grupy, pomiar, var)
+```
+
+
+
+### Test Kruskala-Wallisa
+
+```{r}
+df %>% 
+  kruskal_wallis_test(grupy, pomiar, var)
+```
+
+## 2 pomiar
+ 
+Dane
+```{r}
+grupy = c("badana_1", "badana_2", "kontrolna")
+pomiar = c(2)
+```
+
+### Test na normalność rozkładu 
+```{r warning=F}
+df %>% 
+  normality_test(grupy, pomiar, var)
+```
+### Statystyka opisowa
+```{r warning=F}
+df %>% 
+  stat_opisowa_testy(grupy, pomiar, !!sym(var))
+```
+
+
+### ANOVA
+```{r}
+df %>% 
+  anova_test(grupy, pomiar, var)
+```
+
+
+
+### Test Kruskala-Wallisa
+
+
+```{r}
+df %>% 
+  kruskal_wallis_test(grupy, pomiar, var)
+```
+
+
+## 3 pomiar
+ 
+Dane
+```{r}
+
+grupy = c("badana_1", "badana_2", "kontrolna")
+pomiar = c(3)
+```
+
+### Test na normalność rozkładu 
+```{r warning=F}
+df %>% 
+  normality_test(grupy, pomiar, var)
+```
+### Statystyka opisowa
+```{r warning=F}
+df %>% 
+  stat_opisowa_testy(grupy, pomiar, !!sym(var))
+```
+
+
+### ANOVA
+```{r}
+df %>% 
+  anova_test(grupy, pomiar, var)
+```
+
+
+### Test Kruskala-Wallisa
+
+
+```{r}
+df %>% 
+  kruskal_wallis_test(grupy, pomiar, var)
+```
+
+
+## 4 pomiar
+ 
+Dane
+```{r}
+
+grupy = c("badana_1", "badana_2", "kontrolna")
+pomiar = c(4)
+```
+
+### Test na normalność rozkładu 
+```{r warning=F}
+df %>% 
+  normality_test(grupy, pomiar, var)
+```
+### Statystyka opisowa
+```{r warning=F}
+df %>% 
+  stat_opisowa_testy(grupy, pomiar, !!sym(var))
+```
+
+
+### ANOVA
+```{r}
+df %>% 
+  anova_test(grupy, pomiar, var)
+```
+
+
+
+### Test Kruskala-Wallisa
+
+```{r}
+df %>% 
+  kruskal_wallis_test(grupy, pomiar, var)
+```
+
+
+# Analiza w grupach
+
+
+## grupa "badana_1" w pomiarach
+
+Dane
+```{r}
+grupy = c("badana_1")
+pomiar = c(1, 2, 3, 4)
+
+```
+
+
+### test na normalność rozkładów 
+```{r}
+df %>% 
+  normality_test_zal(grupy, pomiar, var)
+```
+
+### Statystyka opisowa
+
+
+```{r}
+df %>% 
+  stat_opisowa_zal(grupy, pomiar, var)
+```
+
+
+### test Friedmana
+
+```{r}
+df %>% 
+  test_friedmana(grupy, pomiar, var)
+
+```
+Wilcoxon test results:
+```{r}
+df %>% 
+  wilcoxon_zal(grupy, pomiar, var)
+```
+
+
+### Anova (dependent)
+
+```{r}
+df %>% 
+  anova_test_zal(grupy, pomiar, var, id_osoby)
+```
+
+Post-hoc test:
+```{r}
+df %>% 
+  pairwise_paired_t_tests(grupy, pomiar, var, id_osoby)
+
+```
+
+
+
+## grupa "badana_2" w pomiarach
+
+Dane
+```{r}
+grupy = c("badana_2")
+pomiar = c(1, 2, 3, 4)
+
+```
+
+
+### test na normalność rozkładów 
+```{r}
+df %>% 
+  normality_test_zal(grupy, pomiar, var)
+```
+
+### Statystyka opisowa
+
+
+```{r}
+df %>% 
+  stat_opisowa_zal(grupy, pomiar, var)
+```
+
+
+### test Friedmana
+
+```{r}
+df %>% 
+  test_friedmana(grupy, pomiar, var)
+
+```
+Wilcoxon test results:
+```{r}
+df %>% 
+  wilcoxon_zal(grupy, pomiar, var)
+```
+
+
+### Anova (dependent)
+
+```{r}
+df %>% 
+  anova_test_zal(grupy, pomiar, var, id_osoby)
+```
+
+Post-hoc test:
+```{r}
+df %>% 
+  pairwise_paired_t_tests(grupy, pomiar, var, id_osoby)
+
+```
+
+
+
+
+## grupa "kontrolna" w pomiarach
+
+Dane
+```{r}
+grupy = c("kontrolna")
+pomiar = c(1, 2, 3, 4)
+
+```
+
+
+### test na normalność rozkładów 
+```{r}
+df %>% 
+  normality_test_zal(grupy, pomiar, var)
+```
+
+### Statystyka opisowa
+
+
+```{r}
+df %>% 
+  stat_opisowa_zal(grupy, pomiar, var)
+```
+
+
+### test Friedmana
+
+```{r}
+df %>% 
+  test_friedmana(grupy, pomiar, var)
+
+```
+Wilcoxon test results:
+```{r}
+df %>% 
+  wilcoxon_zal(grupy, pomiar, var)
+```
+
+
+### Anova (dependent)
+
+```{r}
+df %>% 
+  anova_test_zal(grupy, pomiar, var, id_osoby)
+```
+
+Post-hoc test:
+```{r}
+df %>% 
+  pairwise_paired_t_tests(grupy, pomiar, var, id_osoby)
+
+```
+
+
+

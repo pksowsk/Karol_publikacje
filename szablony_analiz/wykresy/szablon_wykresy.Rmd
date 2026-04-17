@@ -1,0 +1,501 @@
+---
+title: "wykresy"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+```
+
+
+
+```{r warning=F, include=F}
+library(tidyverse)
+library(ggforce)
+library(ggridges)
+library(ggthemes)
+library(viridis)
+
+```
+
+
+```{r include=F}
+# df_raw <- openxlsx::read.xlsx('../../Dane/Dane-08-06-2022a.xlsx') %>%
+#   janitor::clean_names()
+
+df_raw <- openxlsx::read.xlsx('../../Dane/2023-09-07 hormony.xlsx') %>%
+  janitor::clean_names()
+
+
+
+df <- df_raw %>% 
+  mutate(grupa = case_when(str_detect(id_osoby, "B") ~ "EG1",
+                           str_detect(id_osoby, "Z") ~ "EG2",
+                           TRUE ~ "CG"),
+         .before = id_osoby) %>%  
+  mutate(
+    id_pomiaru = case_when(
+      id_pomiaru == 1 ~ 1,
+      id_pomiaru == 2 ~ 6,
+      id_pomiaru == 3 ~ 12,
+      id_pomiaru == 4 ~ 16,
+    ),
+    grupa = factor(grupa, levels = c("EG1", "EG2", "CG")),
+    id_osoby = factor(id_osoby),
+    id_pomiaru = factor(id_pomiaru),
+    nazwisko = factor(nazwisko)
+  ) 
+
+
+ # df %>% 
+ #   group_by(grupa, id_pomiaru) %>% 
+ #   summarize(n = n())
+
+# skimr::skim(df)
+
+# df %>%
+# colnames()
+```
+
+
+
+```{r include=F}
+df %>% 
+  colnames()
+```
+
+# Nowe
+
+Dane
+```{r}
+
+
+grupy = c("EG1","EG2", "CG")
+
+var = "leptyna_ng_lml"
+title = "Leptyna"
+title_to_save = "leptyna"
+
+x_title = "tydzień badań"
+y_title = "[ng/ml]"
+
+
+```
+
+
+
+```{r}
+
+
+plot <- df %>% 
+  filter(
+    grupa %in% grupy,
+    .data[[var]] > 0
+    ) %>% 
+  # select(.data[[var]])
+  ggplot(aes(x = id_pomiaru, y = .data[[var]], color = grupa)) +
+  geom_boxplot(alpha = 0.7, 
+            show.legend = F) +
+  # stat_summary(fun.y=mean, geom="point", size=3, color = "red", aes(shape = "średnia"))+
+  # scale_shape_manual(values = c("średnia"=20))+  
+  geom_sina(aes(color = grupa),
+            alpha = 0.25,
+            show.legend = F)+
+  facet_wrap(~grupa)+
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+        plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+        legend.position = 'right',
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white"),
+        legend.background = element_rect(fill = "white")) +
+  labs(title = title,
+       x = x_title,
+       y = y_title)+
+  # scale_y_continuous(limits = c(NA, 37))+
+  scale_color_tableau("Tableau 10")
+
+
+
+plot
+```
+
+```{r}
+ggsave(paste0(title_to_save, "_box_.png"), width = 8, height = 6, plot = plot, dpi = 300)
+
+```
+
+Tableau 10, Tableau 20, Color Blind, Seattle Grays, Traffic, Miller Stone, Superfishel Stone, Nuriel Stone, Jewel Bright, Summer, Winter, Green-Orange-Teal, Red-Blue-Brown, Purple-Pink-Gray, Hue Circle, Classic 10, Classic 10 Medium, Classic 10 Light, Classic 20, Classic Gray 5, Classic Color Blind, Classic Traffic Light, Classic Purple-Gray 6, Classic Purple-Gray 12, Classic Green-Orange 6, Classic Green-Orange 12, Classic Blue-Red 6, Classic Blue-Red 12, Classic Cyclic.
+
+
+
+test nowego wykresu (że średnimi i odchyleniami st zamiast mediany i Q75)
+
+```{r include=F}
+df %>% 
+  colnames()
+```
+
+Dane
+```{r}
+
+
+grupy = c("EG1","EG2", "CG")
+
+var = "il_8_pg_ml"
+title = "Il 8"
+title_to_save = "il_8"
+
+x_title = "tydzień badań"
+y_title = "[pg/ml]"
+
+
+```
+
+
+```{r}
+# definicja funkcji pomocniczej
+min_mean_sd_max <- function(x) {
+  r <- c(min(x), mean(x) - sd(x), mean(x), mean(x) + sd(x), max(x))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}
+
+
+p1 <- df %>% 
+  filter(
+    grupa %in% grupy,
+    .data[[var]] > 0
+    ) %>% 
+  ggplot(aes(x = id_pomiaru, y = .data[[var]], color = grupa))
+
+p2 <- p1 +
+  stat_summary(fun.data = min_mean_sd_max, geom = "boxplot", show.legend = F) +
+  geom_sina(aes(color = grupa),
+            alpha = 0.25,
+            show.legend = F)+
+  facet_wrap(~grupa)+
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+        plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+        legend.position = 'right',
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white"),
+        legend.background = element_rect(fill = "white")) +
+  labs(title = title,
+       x = x_title,
+       y = y_title)+
+  scale_color_tableau("Tableau 10")
+  
+  
+p2
+```
+
+```{r}
+ggsave(paste0(title_to_save, "_box_mean_sd_v2.png"), width = 8, height = 6, plot = p2, dpi = 300)
+```
+
+
+
+Poniższy wykres do obczajenia:
+
+```{r}
+ggplot_box_legend <- function(family = "serif"){
+
+  # Create data to use in the boxplot legend:
+  set.seed(100)
+
+  sample_df <- data.frame(parameter = "test",
+                        values = sample(500))
+
+  # Extend the top whisker a bit:
+  sample_df$values[1:100] <- 701:800
+  # Make sure there's only 1 lower outlier:
+  sample_df$values[1] <- -350
+
+  # Function to calculate important values:
+  ggplot2_boxplot <- function(x){
+
+    quartiles <- as.numeric(quantile(x,
+                                     probs = c(0.25, 0.5, 0.75)))
+
+    names(quartiles) <- c("25th percentile",
+                          "50th percentile\n(median)",
+                          "75th percentile")
+
+    IQR <- diff(quartiles[c(1,3)])
+
+    upper_whisker <- max(x[x < (quartiles[3] + 1.5 * IQR)])
+    lower_whisker <- min(x[x > (quartiles[1] - 1.5 * IQR)])
+
+    upper_dots <- x[x > (quartiles[3] + 1.5*IQR)]
+    lower_dots <- x[x < (quartiles[1] - 1.5*IQR)]
+
+    return(list("quartiles" = quartiles,
+                "25th percentile" = as.numeric(quartiles[1]),
+                "50th percentile\n(median)" = as.numeric(quartiles[2]),
+                "75th percentile" = as.numeric(quartiles[3]),
+                "IQR" = IQR,
+                "upper_whisker" = upper_whisker,
+                "lower_whisker" = lower_whisker,
+                "upper_dots" = upper_dots,
+                "lower_dots" = lower_dots))
+  }
+
+  # Get those values:
+  ggplot_output <- ggplot2_boxplot(sample_df$values)
+
+  # Lots of text in the legend, make it smaller and consistent font:
+  update_geom_defaults("text",
+                     list(size = 3,
+                          hjust = 0,
+                          family = family))
+  # Labels don't inherit text:
+  update_geom_defaults("label",
+                     list(size = 3,
+                          hjust = 0,
+                          family = family))
+
+  # Create the legend:
+  # The main elements of the plot (the boxplot, error bars, and count)
+  # are the easy part.
+  # The text describing each of those takes a lot of fiddling to
+  # get the location and style just right:
+  explain_plot <- ggplot() +
+    stat_boxplot(data = sample_df,
+                 aes(x = parameter, y=values),
+                 geom ='errorbar', width = 0.3) +
+    geom_boxplot(data = sample_df,
+                 aes(x = parameter, y=values),
+                 width = 0.3, fill = "lightgrey") +
+    geom_text(aes(x = 1, y = 950, label = "500"), hjust = 0.5) +
+    geom_text(aes(x = 1.17, y = 950,
+                  label = "Number of values"),
+              fontface = "bold", vjust = 0.4) +
+    theme_minimal(base_size = 5, base_family = family) +
+    geom_segment(aes(x = 2.3, xend = 2.3,
+                     y = ggplot_output[["25th percentile"]],
+                     yend = ggplot_output[["75th percentile"]])) +
+    geom_segment(aes(x = 1.2, xend = 2.3,
+                     y = ggplot_output[["25th percentile"]],
+                     yend = ggplot_output[["25th percentile"]])) +
+    geom_segment(aes(x = 1.2, xend = 2.3,
+                     y = ggplot_output[["75th percentile"]],
+                     yend = ggplot_output[["75th percentile"]])) +
+    geom_text(aes(x = 2.4, y = ggplot_output[["50th percentile\n(median)"]]),
+              label = "Interquartile\nrange", fontface = "bold",
+              vjust = 0.4) +
+    geom_text(aes(x = c(1.17,1.17),
+                  y = c(ggplot_output[["upper_whisker"]],
+                        ggplot_output[["lower_whisker"]]),
+                  label = c("Largest value within 1.5 times\ninterquartile range above\n75th percentile",
+                            "Smallest value within 1.5 times\ninterquartile range below\n25th percentile")),
+                  fontface = "bold", vjust = 0.9) +
+    geom_text(aes(x = c(1.17),
+                  y =  ggplot_output[["lower_dots"]],
+                  label = "Outside value"),
+              vjust = 0.5, fontface = "bold") +
+    geom_text(aes(x = c(1.9),
+                  y =  ggplot_output[["lower_dots"]],
+                  label = "-Value is >1.5 times and"),
+              vjust = 0.5) +
+    geom_text(aes(x = 1.17,
+                  y = ggplot_output[["lower_dots"]],
+                  label = "<3 times the interquartile range\nbeyond either end of the box"),
+              vjust = 1.5) +
+    geom_label(aes(x = 1.17, y = ggplot_output[["quartiles"]],
+                  label = names(ggplot_output[["quartiles"]])),
+              vjust = c(0.4,0.85,0.4),
+              fill = "white", label.size = 0) +
+    ylab("") + xlab("") +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank(),
+          aspect.ratio = 4/3,
+          plot.title = element_text(hjust = 0.5, size = 10)) +
+    coord_cartesian(xlim = c(1.4,3.1), ylim = c(-600, 900)) +
+    labs(title = "EXPLANATION")
+
+  return(explain_plot)
+
+}
+
+plot <- ggplot_box_legend()
+
+plot
+```
+
+```{r}
+ggsave("legenda.png", plot, height = 8, width = 10, dpi = 300)
+```
+
+
+
+```{r}
+for (i in 1:4){
+  
+  
+  pomiar = c(i)
+  subtitle = paste("pomiar", pomiar)
+    
+  plot <- df %>% 
+    filter(
+      id_pomiaru == pomiar,
+      grupa %in% grupy) %>% 
+  ggplot(aes(x = grupa, y = .data[[var]], color = grupa)) +
+  geom_boxplot(alpha = 0.5, 
+            show.legend = F) +
+  stat_summary(fun.y=mean, geom="point", size=3, color = "red", aes(shape = "średnia"))+
+  scale_shape_manual(values = c("średnia"=20))+  
+  geom_sina(aes(color = grupa),
+            alpha = 0.25,
+            show.legend = F)+
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+        plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+        legend.position = 'right',
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white"),
+        legend.background = element_rect(fill = "white")) +
+  labs(title = title,
+       x = x_title,
+       y = y_title,
+       shape="")+
+  guides(color = guide_legend(override.aes = list(shape = c("średnia"=16))))  +
+  scale_color_tableau()
+  
+  ggsave(paste0(title_to_save, "_box.png"), width = 8, height = 6, plot = plot, dpi = 300)
+  
+  
+}
+```
+
+
+
+
+
+
+# Stare
+
+# wykresy pomiędzy grupami
+
+Dane
+```{r}
+var = "irisyna_ng_ml"
+
+grupy = c("badana 1", "badana 2", "kontrolna")
+
+title = "Iryzyna"
+title_to_save = "iryzyna"
+
+x_title = "Grupy"
+y_title = "ng/ml"
+
+i = 1
+```
+
+
+
+```{r}
+for (i in 1:4){
+  
+  
+  pomiar = c(i)
+  subtitle = paste("pomiar", pomiar)
+    
+  plot <- df %>% 
+    filter(
+      id_pomiaru == pomiar,
+      grupa %in% grupy) %>% 
+  ggplot(aes(x = grupa, y = .data[[var]], color = grupa)) +
+  geom_boxplot(alpha = 0.5, 
+            show.legend = F) +
+  stat_summary(fun.y=mean, geom="point", size=3, color = "red", aes(shape = "średnia"))+
+  scale_shape_manual(values = c("średnia"=20))+  
+  geom_sina(aes(color = grupa),
+            alpha = 0.25,
+            show.legend = F)+
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+        plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+        legend.position = 'right',
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white"),
+        legend.background = element_rect(fill = "white")) +
+  labs(title = title,
+       subtitle = subtitle,
+       x = x_title,
+       y = y_title,
+       shape="")+
+  guides(color = guide_legend(override.aes = list(shape = c("średnia"=16))))  +
+  scale_color_tableau()
+  
+  ggsave(paste0(title_to_save, "_box_", pomiar, ".png"), width = 8, height = 6, plot = plot, dpi = 300)
+  
+  
+}
+```
+
+
+w grupach
+
+
+Dane
+```{r}
+var = "irisyna_ng_ml" 
+
+grupa = c("badana 1", "badana 2", "kontrolna")
+
+pomiar = c(1, 2, 3, 4)
+
+title = "Iryzyna"
+title_to_save = "iryzyna"
+
+
+x_title = "pomiary"
+y_title = "ng/ml"
+```
+
+```{r warning=F}
+for (i in grupa){
+  
+  
+  grupy = c(i)
+  subtitle = paste("grupa", grupy)
+
+  plot <- df %>% 
+      filter(
+        id_pomiaru %in% pomiar,
+        grupa %in% grupy) %>% 
+    ggplot(aes(x = id_pomiaru, y = .data[[var]], color = id_pomiaru)) +
+     geom_boxplot(alpha = 0.5, 
+            show.legend = F) +
+  stat_summary(fun.y=mean, geom="point", size=3, color = "red", aes(shape = "średnia"))+
+  scale_shape_manual(values = c("średnia"=20))+  
+  geom_sina(aes(color = id_pomiaru),
+            alpha = 0.25,
+            show.legend = F)+
+    theme_classic() +
+    theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+          plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+          legend.position = 'right',
+          panel.background = element_rect(fill = "white"),
+          plot.background = element_rect(fill = "white"),
+          legend.background = element_rect(fill = "white")) +
+    labs(title = title,
+         subtitle = subtitle,
+         x = x_title,
+         y = y_title,
+         shape = "")+
+    guides(color = guide_legend(override.aes = list(shape = c("średnia"=16))))  +
+    scale_color_tableau()
+  
+  ggsave(paste0(title_to_save, "_box_", grupy, ".png"), width = 8, height = 6, plot = plot, dpi = 300)
+
+}
+```

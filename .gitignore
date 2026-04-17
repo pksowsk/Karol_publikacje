@@ -1,0 +1,42 @@
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+*.png
+*.xlsx
+*.html
+
+
+
+# R / RStudio session state
+.Rproj.user/
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+
+# Local environment / secrets
+.Renviron
+.env
+.env.*
+
+# Quarto / knitr caches
+.quarto/
+*_cache/
+
+# renv local library
+renv/library/
+renv/staging/
+
+
+
+# Package check artifacts
+.Rcheck/
+*.Rcheck/
+
+# Local generated outputs kept outside archival folders
+wyniki_robocze/
+archiwum/
+Dane/
+2025-11/

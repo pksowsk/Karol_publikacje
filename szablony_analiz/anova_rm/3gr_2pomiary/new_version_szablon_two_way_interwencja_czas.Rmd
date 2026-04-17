@@ -1,0 +1,584 @@
+---
+title: "Raport zmiennej: interwencja × czas (LMM/ANOVA)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  my_param: "adiponektyna_ng_ml"
+  data_path: "Dane/2025_07_26_publikacja.xlsx"
+  sheet: 1
+  summary_dir: "wyniki_robocze/3gr_2pomiary_framework/_summary"
+  plots_dir: "wyniki_robocze/3gr_2pomiary_framework/plots"
+  do_ancova: true
+  meta_row: !r tibble::tibble()  # pojedynczy wiersz z metadanych; przekazywany z notatnika batch
+---
+
+> **Ten raport** przedstawia kompletną analizę jednej zmiennej, z diagnostyką, modelami (ANOVA z korekcjami GG/HF oraz LMM), testami post‑hoc z `emmeans`, efektami i wizualizacjami. Kończy się zapisaniem krótkiego podsumowania do CSV, które zbierze notatnik batch.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+## Pakiety
+
+```{r }
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(openxlsx)
+library(here)
+library(rstatix)     # outliers, levene
+library(afex)        # ANOVA z korekcjami GG/HF
+library(lme4)
+library(lmerTest)    # p-value dla lmer
+library(emmeans)
+library(effectsize)  # η², d, interpretacje, CI
+library(ggpubr)
+library(ggforce)
+library(ggdist)
+library(glue)
+library(fs)
+```
+
+## Parametry i metadane
+
+```{r }
+var <- params$my_param
+meta_row <- params$meta_row
+
+# Ustal etykietę i jednostkę – jeśli brak w meta, użyj nazwy kolumny
+etykieta  <- meta_row$etykieta  %||% var
+jednostka <- meta_row$jednostka %||% NA_character_
+transf    <- meta_row$transformacja %||% "none"
+domena_dodatnia <- as.logical(meta_row$domena_dodatnia %||% TRUE)
+```
+
+## Wczytanie i przygotowanie danych
+
+
+```{r }
+raw <- readxl::read_excel(here::here(params$data_path), sheet = params$sheet) |>
+  janitor::clean_names() |>
+  filter(!is.na(id_osoby))
+
+# Mapowanie id_pomiaru → czas / interwencja – dopasowane do Twojej logiki
+prep <- raw |>
+  mutate(
+    czas = case_when(
+      id_pomiaru %in% c(0, 2, 4) ~ "początek",
+      id_pomiaru %in% c(1, 3, 5) ~ "koniec",
+      TRUE ~ NA_character_
+    ),
+    interwencja = case_when(
+      id_pomiaru %in% c(0, 1) ~ "trening",
+      id_pomiaru %in% c(2, 3) ~ "trening_dieta",
+      id_pomiaru %in% c(4, 5) ~ "grupa_kontrolna",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  mutate(
+    czas = factor(czas, levels = c("początek","koniec")),
+    interwencja = factor(interwencja, levels = c("trening","trening_dieta","grupa_kontrolna")),
+    id_osoby = paste0(id_osoby, "_", interwencja)
+  ) |>
+  mutate_if(is.character, factor)
+
+stopifnot(var %in% names(prep))
+
+
+
+prep %>% 
+  filter(
+    interwencja == "trening_dieta",
+    czas == "koniec"
+    ) %>% 
+  select(met_intensywne)
+```
+
+### Aplikacja transformacji i walidacje
+
+-   Jeśli `transformacja == "log10"` – zastosujemy `log10()` do wartości dodatnich.
+-   Jeżeli `domena_dodatnia == TRUE`, ostrzegamy o wartościach ≤ 0.
+
+```{r include=FALSE}
+vec <- prep[[var]]
+if (isTRUE(domena_dodatnia) && any(vec <= 0, na.rm = TRUE)) {
+  warning(glue("Zmienna {var} zawiera wartości <= 0; sprawdź metadane i LOD."))
+}
+
+prep <- prep |>
+  mutate(zmienna = {{ vec }}) |>
+  mutate(zmienna = case_when(
+    transf == "log10" ~ log10(zmienna),
+    transf == "loge"  ~ log(zmienna),
+    TRUE ~ zmienna
+  ))
+
+```
+
+### Zbiór do analizy
+
+Nie wymuszamy kompletnych par; **LMM** poradzi sobie z brakami. Dla **ANOVA** (afex) brakujące przypadki w danym układzie zostaną wykluczone, ale nadal wykorzystamy maksymalnie dostępne dane.
+
+```{r }
+df <- prep |>
+  select(id_osoby, id_pomiaru, czas, interwencja, zmienna) |>
+  drop_na(czas, interwencja)
+
+nrow(df); df |> skimr::skim(zmienna)
+```
+
+## Diagnostyka wstępna
+
+### Odstające obserwacje (per komórka układu)
+
+```{r}
+outliers <- df |>
+  group_by(interwencja, czas) |>
+  rstatix::identify_outliers(zmienna)
+
+outliers
+```
+
+
+```{r}
+# Dynamiczna interpretacja
+if (nrow(outliers) == 0) {
+  cat("Nie wykryto obserwacji odstających.\n")
+} else {
+  n_ext <- sum(outliers$is.extreme, na.rm = TRUE)
+  n_out <- nrow(outliers)
+  cat(glue::glue(
+    "Wykryto {n_out} obserwacji odstających, w tym {n_ext} skrajnych. ",
+    "Zweryfikuj merytorycznie (błąd, LOD, artefakt). Obserwacji nie usuwamy automatycznie."
+  ))
+  
+}
+
+```
+
+
+
+> **Uwaga interpretacyjna:** wykrywanie odstających jest wrażliwe na liczebności i rozkłady. Obserwacji nie usuwamy automatycznie; należy rozważyć ich zasadność merytorycznie (błąd, LOD, artefakt).
+
+### Jednorodność wariancji (Levene)
+
+```{r}
+lev <- rstatix::levene_test(df, zmienna ~ interwencja * czas)
+lev
+```
+
+
+```{r}
+p_lev <- lev$p %>% min(na.rm = TRUE)
+if (p_lev < 0.05) {
+  cat(glue::glue(
+    "Test Levene'a: p = {scales::pvalue(p_lev)} < 0.05 — wariancje niejednorodne. ",
+    "LMM jest bardziej odporny; wyniki ANOVA interpretuj ostrożnie. ",
+    "Rozważ transformację (log) lub modele odporne/permutacyjne."
+  ))
+} else {
+  cat(glue::glue(
+    "Test Levene'a: p = {scales::pvalue(p_lev)} — brak podstaw do odrzucenia jednorodności wariancji."
+  ))
+}
+```
+
+
+### Normalność reszt (wstępny model liniowy)
+
+Wstępny model (bez efektów losowych) służy jedynie do diagnostyki reszt.
+
+```{r}
+mod_diag <- lm(zmienna ~ interwencja * czas, data = df)
+res <- residuals(mod_diag)
+shapiro <- shapiro.test(res)
+shapiro
+```
+
+
+```{r, fig.height=4}
+par(mfrow = c(1,2))
+qqnorm(res); qqline(res)
+hist(res, main = "Histogram reszt", xlab = "reszty")
+par(mfrow = c(1,1))
+```
+
+```{r}
+p_sh <- shapiro$p.value
+if (p_sh < 0.05) {
+  cat(glue::glue(
+    "Shapiro–Wilk dla reszt: p = {scales::pvalue(p_sh)} < 0.05 — odchylenie od normalności. ",
+    "Transformacja (", transf, ") i LMM zwykle łagodzą wpływ."
+  ))
+} else {
+  cat(glue::glue("Shapiro–Wilk dla reszt: p = {scales::pvalue(p_sh)} — normalność nieodrzucona."))
+}
+```
+
+
+
+> **Komentarz:** Shapiro–Wilk na resztach testuje zgodność rozkładu błędów z normalnością. Przy umiarkowanych liczebnościach drobne odchylenia nie muszą istotnie wpływać na wnioski, zwłaszcza przy LMM i porównaniach EMM z estymacją opartą na modelu Gaussa. W razie silnych naruszeń rozważ transformację (zastosowaliśmy) lub modele odporne / permutacyjne.
+
+## Modele statystyczne
+
+### 1) ANOVA z korekcjami GG/HF (afex)
+
+```{r}
+afex::afex_options(correction = "GG", es_aov = "ges")
+
+fit_aov <- afex::aov_car(
+  zmienna ~ interwencja * czas + Error(id_osoby/czas),
+  data = df,
+  factorize = FALSE
+)
+
+aov_tab <- summary(fit_aov)$univariate.tests
+(aov_tab)
+```
+
+```{r}
+# Efekty (η²g) z CI
+eta <- effectsize::eta_squared(fit_aov, partial = FALSE, ci = 0.95)
+eta
+```
+
+```{r}
+# Dynamiczna interpretacja ANOVA
+get_p_aov <- function(x, eff){
+  if (eff %in% rownames(x)) unname(x[eff, "Pr(>F)"]) else NA_real_
+}
+p_int_aov  <- get_p_aov(aov_tab, "interwencja:czas")
+p_intv_aov <- get_p_aov(aov_tab, "interwencja")
+p_time_aov <- get_p_aov(aov_tab, "czas")
+
+
+cat(glue::glue(
+  "ANOVA (afex): interakcja p={scales::pvalue(p_int_aov)}, ",
+  "interwencja p={scales::pvalue(p_intv_aov)}, ",
+  "czas p={scales::pvalue(p_time_aov)}."
+))
+```
+
+
+### 2) Model mieszany (domyślny do wnioskowania)
+
+```{r}
+fit_lmm <- lmerTest::lmer(zmienna ~ interwencja * czas + (1|id_osoby), data = df)
+
+anova_lmm <- anova(fit_lmm, type = 3)  # Type III dla interakcji
+anova_lmm
+
+# Różne miary efektu – częściowe eta² przez ANOVA z afex już mamy; tu możemy raportować także marginal R2
+r2_lmm <- performance::r2_nakagawa(fit_lmm)
+r2_lmm
+```
+
+
+
+```{r}
+p_int  <- anova_lmm["interwencja:czas", "Pr(>F)"] %||% NA_real_
+p_intv <- anova_lmm["interwencja",      "Pr(>F)"] %||% NA_real_
+p_time <- anova_lmm["czas",             "Pr(>F)"] %||% NA_real_
+
+cat(glue::glue(
+  "LMM: interakcja p={scales::pvalue(p_int)}, ",
+  "interwencja p={scales::pvalue(p_intv)}, ",
+  "czas p={scales::pvalue(p_time)}. ",
+  "R²_marginal={round(r2_lmm$R2_marginal,3)}, R²_conditional={round(r2_lmm$R2_conditional,3)}."
+))
+
+agree <- c(
+  sign(p_int_aov  < 0.05) == sign(p_int  < 0.05),
+  sign(p_intv_aov < 0.05) == sign(p_intv < 0.05),
+  sign(p_time_aov < 0.05) == sign(p_time < 0.05)
+)
+if (!all(agree, na.rm = TRUE)) {
+  cat("\nUwaga: wnioski ANOVA vs LMM częściowo się różnią — **priorytet ma LMM**.")
+}
+```
+
+
+
+
+> **Rekomendacja praktyczna:** gdy liczebności i braki danych różnią się między grupami, LMM jest bardziej elastyczny. ANOVA (afex) służy jako punkt odniesienia i do sprawdzenia zbieżności wniosków.
+
+## Post‑hoc / EMM
+
+W zależności od tego, czy **interakcja** jest istotna, stosujemy różne porównania:
+
+-   **Interakcja istotna** → porównania grup w ramach poziomów czasu i/lub porównania czasu w ramach grup.
+-   **Interakcja nieistotna** → porównania głównych efektów (grup **bez** rozróżniania czasu, czasu z uwzględnieniem zależności w parach).
+
+```{r}
+# Ocena istotności interakcji na podstawie LMM
+p_int <- anova_lmm["interwencja:czas", "Pr(>F)"] %||% NA_real_
+
+emm_interw_by_time <- emmeans(fit_lmm, ~ interwencja | czas)
+pairs_interw_by_time <- pairs(emm_interw_by_time, adjust = "tukey")
+
+emm_time_by_interw <- emmeans(fit_lmm, ~ czas | interwencja)
+pairs_time_by_interw <- pairs(emm_time_by_interw, adjust = "bonferroni")
+
+emm_main_interw <- emmeans(fit_lmm, ~ interwencja)
+pairs_main_interw <- pairs(emm_main_interw, adjust = "tukey")
+
+emm_main_time <- emmeans(fit_lmm, ~ czas)
+pairs_main_time <- pairs(emm_main_time, adjust = "bonferroni")
+```
+
+```{r}
+p_int
+if (!is.na(p_int) && p_int < 0.05) {
+  cat("Interakcja istotna – prezentuję porównania w przekrojach.\n")
+  pairs_interw_by_time
+  pairs_time_by_interw
+} else {
+  cat("Interakcja nieistotna – prezentuję porównania głównych efektów.\n")
+  pairs_main_interw
+  pairs_main_time
+}
+```
+
+
+
+```{r}
+# Dynamiczne podsumowanie najistotniejszych kontrastów
+extract_sig <- function(pairs_obj, label){
+  as_tibble(pairs_obj) %>%
+    mutate(source = label) %>%
+    rename(p = p.value, estimate = estimate) %>%
+    filter(!is.na(p)) %>% arrange(p) %>% filter(p < 0.05) %>% slice_head(n = 5)
+}
+
+sig_list <- list(
+  extract_sig(pairs_interw_by_time, "interwencja|czas"),
+  extract_sig(pairs_time_by_interw, "czas|interwencja"),
+  extract_sig(pairs_main_interw, "interwencja"),
+  extract_sig(pairs_main_time, "czas")
+) %>% bind_rows()
+
+if (nrow(sig_list) == 0) {
+  cat("Brak istotnych kontrastów po korekcji w zestawach porównań.")
+} else {
+  sig_list %>% mutate(p_fmt = scales::pvalue(p)) %>% dplyr::select(source, contrast, estimate, p_fmt)
+}
+```
+
+
+### Rozmiary efektów i ich interpretacje
+
+Dla porównań parami wyznaczymy **Cohen’s d** z CI.
+
+```{r}
+# d dla zmiany w czasie w obrębie każdej interwencji (paired)
+# najpierw potrzebny jest zbiór szeroki (początek/koniec w kolumnach)
+wide <- df |>
+  select(id_osoby, interwencja, czas, zmienna) |>
+  pivot_wider(names_from = czas, values_from = zmienna)
+
+cohens_time <- wide |>
+  group_by(interwencja) |>
+  summarise(
+    d = effectsize::cohens_d(koniec, początek, paired = TRUE)$Cohens_d,
+    .groups = "drop"
+  )
+cohens_time
+```
+
+## Wizualizacje
+
+0) Boxplot – z adnotacjami p‑value
+
+> Poniżej dwa warianty:
+>
+> * **Box vs. czas, kolor = interwencja** z testami **paired** (zmiana w czasie w obrębie każdej interwencji).
+> * **Box vs. interwencja, kolor = czas** z testami **niezależnymi** (różnice między interwencjami w ramach każdego czasu).
+>
+> Do adnotacji używamy `rstatix::pairwise_t_test()` oraz `ggpubr::stat_pvalue_manual()`. Wartości są korygowane metodą Bonferroniego. Gdy chcesz pokazać wyniki zgodne z ANOVA/LMM (np. Tukey), użyj wyników `emmeans` w treści raportu, a boxplot traktuj jako ilustrację.
+
+```{r}
+# 0A) Porównania CZAS w obrębie każdej interwencji (paired)
+pwc_time_within <- df %>%
+  group_by(interwencja) %>%
+  rstatix::pairwise_t_test(zmienna ~ czas, paired = TRUE,
+                           p.adjust.method = "bonferroni", detailed = TRUE) %>%
+  rstatix::add_xy_position(x = "czas", dodge = 0.8)
+
+box_czas <- ggpubr::ggboxplot(
+  df, x = "czas", y = "zmienna",
+  color = "interwencja", palette = "jco", add = "jitter",
+  ylab = ifelse(is.na(jednostka), etykieta, paste0(etykieta, " [", jednostka, "]"))
+) +
+  ggpubr::stat_pvalue_manual(
+    pwc_time_within, label = "p.adj.signif", tip.length = 0.01, hide.ns = TRUE
+  ) +
+  theme_classic()
+
+box_czas
+```
+
+```{r}
+# 0B) Porównania INTERWENCJA w obrębie każdego czasu (niezależne)
+pwc_interw_within_time <- df %>%
+  group_by(czas) %>%
+  rstatix::pairwise_t_test(zmienna ~ interwencja, paired = FALSE,
+                           p.adjust.method = "bonferroni", detailed = TRUE) %>%
+  rstatix::add_xy_position(x = "interwencja", dodge = 0.8)
+
+box_interw <- ggpubr::ggboxplot(
+  df, x = "interwencja", y = "zmienna",
+  color = "czas", palette = "jco", add = "jitter",
+  ylab = ifelse(is.na(jednostka), etykieta, paste0(etykieta, " [", jednostka, "]"))
+) +
+  ggpubr::stat_pvalue_manual(
+    pwc_interw_within_time, label = "p.adj.signif", tip.length = 0.01, hide.ns = TRUE
+  ) +
+  theme_classic()
+
+box_interw
+```
+
+
+
+### 1) Trajektorie osobnicze + średnie i CI
+
+```{r}
+plt_spaghetti <- ggplot(df, aes(x = czas, y = zmienna, group = id_osoby)) +
+  geom_line(alpha = 0.25) +
+  stat_summary(aes(group = interwencja, color = interwencja), fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(aes(color = interwencja), fun.data = mean_cl_normal, geom = "errorbar", width = 0.1) +
+  facet_wrap(~ interwencja) +
+  theme_classic() +
+  labs(title = etykieta, x = "czas", y = ifelse(is.na(jednostka), etykieta, paste0(etykieta, " [", jednostka, "]")))
+
+plt_spaghetti
+```
+
+### 2) EMM plot z przedziałami ufności
+
+```{r}
+plt_emm <- emmip(fit_lmm, interwencja ~ czas, CIs = TRUE) +
+  theme_classic() +
+  labs(title = glue("EMM: {etykieta}"), x = "czas", y = "średnia marginalna (±CI)")
+
+plt_emm
+```
+
+### 3) QQ‑plot reszt LMM
+
+```{r}
+res_lmm <- resid(fit_lmm)
+qqnorm(res_lmm); qqline(res_lmm)
+```
+
+## Alternatywa: ANCOVA (opcjonalnie)
+
+Modeluje wynik **końcowy** z kontrolą o wartość **początkową**. Często ma większą moc niż analiza zmiany lub prosty test par.
+
+```{r}
+if (isTRUE(params$do_ancova)) {
+  base_end <- df %>%
+    dplyr::select(id_osoby, interwencja, czas, zmienna) %>%
+    tidyr::pivot_wider(names_from = czas, values_from = zmienna) %>%
+    tidyr::drop_na(początek, koniec)
+
+  fit_ancova <- lm(koniec ~ interwencja + początek, data = base_end)
+  anc_tab <- anova(fit_ancova)
+  anc_eta <- effectsize::eta_squared(fit_ancova, partial = TRUE, ci = 0.95)
+
+  print(anc_tab); print(anc_eta)
+
+  emm_anc <- emmeans(fit_ancova, ~ interwencja)
+  pairs_anc <- pairs(emm_anc, adjust = "tukey")
+  print(pairs_anc)
+
+  p_anc <- anc_tab["interwencja", "Pr(>F)"] %||% NA_real_
+  if (!is.na(p_anc)) {
+    cat(glue::glue(
+      "ANCOVA: efekt interwencji p={scales::pvalue(p_anc)}. ",
+      "Model kontroluje wartość początkową — zwykle większa moc testu."
+    ))
+  }
+}
+```
+
+## Podsumowanie wniosków (narracja)
+
+```{r}
+get_p <- function(tab, row_name){
+  if (row_name %in% rownames(tab)) unname(tab[row_name, "Pr(>F)"]) else NA_real_
+}
+
+p_interakcja  <- get_p(anova_lmm, "interwencja:czas")
+p_interwencja <- get_p(anova_lmm, "interwencja")
+p_czas        <- get_p(anova_lmm, "czas")
+
+# η²g z afex (może mieć inną numerację wierszy; dopasujemy po Effect)
+eta_df <- as.data.frame(eta)
+get_eta <- function(effect){
+  row <- eta_df |> filter(Parameter == effect)
+  if (nrow(row) == 0) return(NA_real_)
+  row$Eta2[1]
+}
+
+ges_interakcja  <- get_eta("interwencja:czas")
+ges_interwencja <- get_eta("interwencja")
+ges_czas        <- get_eta("czas")
+
+sig <- function(p) ifelse(is.na(p), "brak danych", ifelse(p < 0.05, "istotny", "nieistotny"))
+```
+
+**Wnioski kluczowe:**
+
+- Interakcja interwencja × czas: `r sig(p_interakcja)` (`r scales::pvalue(p_interakcja)`, η²g ≈ `r round(ges_interakcja, 3)`).
+- Główny efekt interwencji: `r sig(p_interwencja)` (`r scales::pvalue(p_interwencja)`, η²g ≈ `r round(ges_interwencja, 3)`).
+- Główny efekt czasu: `r sig(p_czas)` (`r scales::pvalue(p_czas)`, η²g ≈ `r round(ges_czas, 3)`).
+- Jednorodność wariancji (Levene): `r ifelse(p_lev < 0.05, paste0('niejednorodne, p=', scales::pvalue(p_lev)), paste0('OK, p=', scales::pvalue(p_lev)))`.
+- Normalność reszt (Shapiro): `r ifelse(p_sh < 0.05, paste0('odchylenie od normalności, p=', scales::pvalue(p_sh)), paste0('OK, p=', scales::pvalue(p_sh)))`.
+
+
+> **Interpretacja:**  
+> • Przy **istotnej interakcji** opieraj wnioski na porównaniach warunkowych (EMM) i trajektoriach.  
+> • Przy **braku interakcji** interpretuj efekty główne.  
+> • **Rozmiary efektów** (η²g, d) i **CI** są kluczowe dla znaczenia praktycznego.  
+> • Gdy Levene wskazuje heterogeniczność wariancji, polegaj głównie na **LMM**; rozważ transformację / modele odporne.  
+> • Jeśli ANOVA i LMM różnią się, **priorytet** ma **LMM**.
+## Zapis krótkiego podsumowania (dla FDR zbiorczego)
+
+```{r}
+summary_row <- tibble(
+  zmienna = var,
+  p_interakcja = p_interakcja,
+  p_interwencja = p_interwencja,
+  p_czas = p_czas,
+  ges_interakcja = ges_interakcja,
+  ges_interwencja = ges_interwencja,
+  ges_czas = ges_czas,
+  n = nrow(df),
+  n_osob = n_distinct(df$id_osoby)
+)
+
+fs::dir_create(params$summary_dir)
+readr::write_csv(summary_row, fs::path(params$summary_dir, paste0(var, ".csv")))
+summary_row
+```
+
+## Zapisy wykresów (opcjonalnie)
+
+```{r}
+fs::dir_create(params$plots_dir)
+
+ggsave(fs::path(params$plots_dir, paste0(var, "_spaghetti.png")), plt_spaghetti, width = 8, height = 5, dpi = 300)
+ggsave(fs::path(params$plots_dir, paste0(var, "_emm.png")), plt_emm, width = 7, height = 5, dpi = 300)
+```
+
+## Informacje o sesji
+
+```{r}
+# sessionInfo()
+```

@@ -1,0 +1,412 @@
+---
+title: "szablon"
+output:
+  html_document:
+    df_print: paged
+    
+params:
+  my_param: "irisyna_ng_ml"
+---
+
+### Analizowany parametr
+
+```{r include=FALSE}
+var = params$my_param
+```
+
+```{r echo=FALSE}
+print(var)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+```
+
+```{r warning=F, include=F}
+library(tidyverse)
+library(psych)
+library(report)
+library(ggridges)
+library(ggthemes)
+library(viridis)
+# library(grubasyKarola)
+library(corrr)
+library(FSA)
+library(emmeans)
+library(ggforce)
+```
+
+```{r include=F}
+df_raw <- openxlsx::read.xlsx('../../../Dane/2025_11_23_publikacja.xlsx', sheet = 1) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(id_osoby))
+
+
+df <- df_raw %>% 
+  mutate(
+    czas = case_when(
+      id_pomiaru %in% c(0, 2, 4) ~ "początek",
+      id_pomiaru %in% c(1, 3, 5) ~ "koniec"
+      ),
+    .before = id_osoby) %>%  
+  mutate(
+    interwencja = case_when(
+      id_pomiaru %in% c(0, 1) ~ "trening",
+      id_pomiaru %in% c(2, 3) ~ "trening_dieta",
+      id_pomiaru %in% c(4, 5) ~ "grupa_kontrolna"
+      ),
+    .before = id_osoby) %>%
+  mutate(id_osoby = paste0(id_osoby, "_", interwencja)) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(czas = fct_relevel(czas, c("początek", "koniec")))
+
+
+df %>%
+  colnames()
+```
+
+```{r include=F}
+sw_test <- function(tbl, pomiar){
+  
+  tbl %>% 
+    dplyr::select(id_pomiaru, zmienna) %>% 
+    na.omit() %>% 
+    filter(id_pomiaru == pomiar) %>% 
+    pull() %>% 
+    shapiro.test()
+}
+
+normality_test_zal <- function(df, pomiar){
+  
+  temp_df <- df 
+
+  for(p in pomiar){
+    
+    print(paste("Pomiar:", p))
+    
+    res <- sw_test(temp_df, pomiar = p)
+    
+    wynik <- if (res$p.value < 0.05) {
+      "Odrzucamy hipotezę o normalności rozkładu"
+    } else {
+      "Nie ma podstaw do odrzucenia hipotezy o normalności rozkładu"
+    }
+    
+    writeLines(paste("Test:", res$method, "\n","Statystyka:", res$statistic, "\n", "p-value", res$p.value, "\n", wynik, "\n"))
+  }
+}
+
+stat_opisowa_zal <- function(df, pomiar){
+  
+   df %>% 
+    filter(id_pomiaru %in% pomiar)  %>% 
+    na.omit() %>% 
+    group_by(interwencja, id_pomiaru) %>% 
+    summarize(psych::describe(zmienna, quant = c(.25, 0.5, .75), fast = T)) %>%
+    mutate(across(mean:Q0.75, round, 3))
+}
+
+
+anova_test_zal <- function(df, grupy, pomiar, var, id_osoby){
+  
+  temp_df <- df %>% 
+    filter(grupa %in% grupy,
+           id_pomiaru %in% pomiar) %>% 
+    select(id_pomiaru, id_osoby, zmienna = !! sym(var))
+    
+  res <- temp_df %>% 
+    rstatix::anova_test(dv = zmienna, wid = id_osoby, within = id_pomiaru)
+  
+  anova_table <- rstatix::get_anova_table(res)
+  
+  wynik <- if (res$ANOVA$p < 0.05) {
+        "Grupy się różnią"
+      } else {
+        "Grupy się nie różnią"
+      }
+  
+  effect <- res$ANOVA$ges
+  
+  print(anova_table)
+  
+  writeLines(paste("\n\n",wynik, "\n\n","Effect size", effect, "\n\n"))
+  
+}
+
+
+anova_two_way_zal <- function(df){
+  
+  anova_result <- rstatix::anova_test(
+    data = temp_df,
+    dv = zmienna,
+    wid = id_osoby,
+    within = czas,
+    between = interwencja
+  )
+
+  
+  
+  return(anova_result)
+}
+
+
+one_way <- function(df){
+  one_way <- df %>%
+  group_by(czas) %>%
+  rstatix::anova_test(
+    # dv = zmienna, wid = id_osoby, within = interwencja
+    dv = zmienna,
+    wid = id_osoby,
+    between = interwencja
+    ) %>%
+  rstatix::get_anova_table() %>%
+  rstatix::adjust_pvalue(method = "bonferroni")
+}
+
+
+
+pairwise_paired_t_tests <- function(df){
+  
+  pwc <- df %>%
+    group_by(interwencja) %>% 
+    rstatix::pairwise_t_test(zmienna ~ czas, paired = TRUE,
+    p.adjust.method = "bonferroni", detailed = TRUE
+    )
+  
+  cohens <- df %>% 
+    group_by(interwencja) %>% 
+    rstatix::cohens_d(zmienna ~ czas, paired = TRUE)
+  
+  print(cohens)
+  return(pwc)
+}
+
+
+interwencja_t_tests <- function(df){
+  
+
+  pwc <- df %>%
+    rstatix::pairwise_t_test(zmienna ~ interwencja, paired = FALSE,
+    p.adjust.method = "bonferroni", detailed = TRUE
+    )
+  
+  return(pwc)
+}
+
+czas_t_tests <- function(df){
+  
+
+  pwc <- df %>% # może wystarczy pogrupować żeby uwzględnić zer jedna zmienna jest paired a druga nie ???!!! SPRAWDZIĆ
+    rstatix::pairwise_t_test(zmienna ~ czas, paired = TRUE,
+    p.adjust.method = "bonferroni", detailed = TRUE
+    )
+  
+  return(pwc)
+}
+
+
+
+bxp_func <- function(df){
+  
+  ggpubr::ggboxplot(
+  df, x = "czas", y = "zmienna",
+  color = "interwencja", palette = "jco", ylab = var
+  )
+
+}
+
+
+qq_plot <- function(){
+  ggpubr::ggqqplot(temp_df, "zmienna", ggtheme = theme_bw()) +
+  facet_grid(czas ~ interwencja, labeller = "label_both")
+}
+
+box_final <- function(box, pwc, anova_result){
+  
+  pwc_1 <- pwc %>% rstatix::add_xy_position(x = "interwencja")
+  box + 
+    ggpubr::stat_pvalue_manual(pwc_1, tip.length = 0, hide.ns = TRUE) +
+    labs(
+      subtitle = rstatix::get_test_label(anova_result, detailed = TRUE),
+      caption = rstatix::get_pwc_label(pwc_1)
+    )  
+}
+```
+
+# Two-way Anova
+
+```{r include=FALSE}
+# modyfikacja danych - usunięcie NA
+# stodujemy dalej df lub temp_df w zależnościo od tego, czego potrzebujemy
+temp_df <- df %>% 
+  dplyr::select(czas, interwencja, id_pomiaru, id_osoby, zmienna = !! sym(var)) %>%
+  add_count(id_osoby) %>% 
+  # filter(n == 2) %>% 
+  dplyr::select(-n)
+  
+
+```
+
+Dane
+
+```{r}
+
+pomiar = c(0, 1, 2, 3, 4, 5)
+
+```
+
+### wizualizacja
+
+```{r}
+box <- temp_df %>% 
+  bxp_func()
+
+box
+```
+
+### test na normalność rozkładów
+
+```{r}
+temp_df %>% 
+  normality_test_zal(pomiar)
+```
+
+```{r}
+qq_plot()
+```
+
+### Statystyka opisowa
+
+```{r}
+temp_df %>% 
+  stat_opisowa_zal(pomiar)
+```
+
+Two-way ANOVA
+
+```{r}
+anova_result <- temp_df %>% 
+  anova_two_way_zal()
+
+anova_result
+```
+
+### Post-hoc
+
+#### estimated marginal means (EMMs)
+
+[Link do opisu](https://cran.r-project.org/web/packages/emmeans/vignettes/basics.html#emms)
+
+```{r include=FALSE}
+linear_model <- aov(zmienna ~ interwencja * czas + Error(id_osoby/czas), data = temp_df)
+```
+
+```{r}
+emmeans_result <- emmeans(linear_model, ~ interwencja | czas)
+pairs(emmeans_result)
+```
+
+```{r}
+emmeans_result <- emmeans(linear_model, ~ czas | interwencja)
+pairs(emmeans_result)
+```
+
+```{r}
+emmeans_result <- emmeans(linear_model, ~ czas * interwencja)
+pairs(emmeans_result)
+```
+
+#### significant two-way interaction
+
+Efekt interwencji w czasie
+
+```{r}
+one_way <- temp_df %>% 
+  one_way()
+
+one_way
+```
+
+```{r}
+pwc <- temp_df %>% 
+  pairwise_paired_t_tests()
+
+pwc
+
+```
+
+#### non-significant two-way interaction
+
+Interwencja
+
+```{r}
+interwencja_test <- temp_df %>%
+  interwencja_t_tests()
+
+interwencja_test
+```
+
+Czas
+
+```{r}
+# comparisons for time variable
+czas_test <- temp_df %>% 
+  czas_t_tests()
+
+czas_test
+```
+
+### Wizualizacja wyniku
+
+```{r}
+box_final(box, pwc, anova_result)
+```
+
+## Wykres ze średnimi
+
+```{r include=FALSE}
+
+title = var
+
+x_title = "tydzień badań"
+y_title = var
+
+
+```
+
+```{r echo=FALSE}
+# definicja funkcji pomocniczej
+min_mean_sd_max <- function(x) {
+  r <- c(min(x), mean(x) - sd(x), mean(x), mean(x) + sd(x), max(x))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}
+
+
+p1 <- temp_df %>% 
+  filter(
+    zmienna > 0
+    ) %>% 
+  ggplot(aes(x = czas, y = zmienna, color = interwencja))
+
+p2 <- p1 +
+  stat_summary(fun.data = min_mean_sd_max, geom = "boxplot", show.legend = F) +
+  geom_sina(aes(color = interwencja),
+            alpha = 0.25,
+            show.legend = F)+
+  facet_wrap(~interwencja)+
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold.italic", hjust = 0.5),
+        plot.subtitle = element_text(face = 'italic', hjust = 0.5),
+        legend.position = 'right',
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white"),
+        legend.background = element_rect(fill = "white")) +
+  labs(title = title,
+       x = x_title,
+       y = y_title)+
+  scale_color_tableau("Tableau 10")
+  
+p2
+```

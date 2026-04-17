@@ -1,0 +1,1214 @@
+---
+title: "Analiza wariancji z powtarzanymi pomiarami"
+
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    theme: cosmo
+    df-print: paged
+params:
+  my_param: "obwod_pasa_cm"
+
+---
+
+## Opis badania
+
+**Struktura pomiarów:**
+
+- Pomiar 1: początek interwencji (0 tygodni)
+- Pomiar 2: po 6 tygodniach
+- Pomiar 3: po 12 tygodniach
+- Pomiar 4: po 16 tygodniach
+
+**Grupy interwencji:**
+
+- Grupa 1: aerobowa
+- Grupa 2: siłowa
+- Grupa 3: kontrolna
+
+
+
+
+```{r setup, message=FALSE, warning=FALSE, include=F}
+library(tidyverse)
+library(rstatix)
+library(emmeans)
+library(car)
+library(psych)
+library(effectsize)
+library(ggpubr)
+library(patchwork)
+library(purrr)  
+library(kableExtra)
+
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=FALSE) 
+# Operator dla powtarzania stringów
+`%R%` <- function(x, y) strrep(x, y)
+```
+
+```{r}
+var <- params$my_param 
+```
+
+
+```{r load-data, include=FALSE}
+
+df_raw <- openxlsx::read.xlsx('../../../Dane/2025_11_23_publikacja.xlsx', sheet = 1) %>% 
+  janitor::clean_names() %>% 
+  filter(!is.na(id_osoby))
+
+
+# Przygotowanie danych
+df <- df_raw %>% 
+  mutate(
+    interwencja = case_when(
+      id_osoby == 1 ~ "aerobowa",
+      id_osoby == 2 ~ "siłowa",
+      id_osoby == 3 ~ "kontrolna"
+    ),
+    czas = case_when(
+      id_pomiaru == 1 ~ "początek",
+      id_pomiaru == 2 ~ "6_tygodni",
+      id_pomiaru == 3 ~ "12_tygodni",
+      id_pomiaru == 4 ~ "16_tygodni"
+    ),
+    .before = id_osoby
+  ) %>%
+  mutate_if(is.character, factor) %>% 
+  mutate(
+    czas = fct_relevel(czas, c("początek", "6_tygodni", "12_tygodni", "16_tygodni")),
+    interwencja = fct_relevel(interwencja, c("aerobowa", "siłowa", "kontrolna")),
+    id_osoby = factor(paste0(nazwisko, "_", imie))
+  )
+
+```
+
+
+
+
+```{r helper-functions, include=FALSE}
+# Funkcje pomocnicze
+# Ulepszona funkcja statystyk opisowych
+stat_opisowa_zal <- function(df, pomiar, var_name, include_incomplete = TRUE){
+  
+  if(include_incomplete) {
+    cat("\nStatystyki dla WSZYSTKICH dostępnych pomiarów\n")
+    cat("(włącznie z niekompletnymi przypadkami)\n\n")
+  } else {
+    cat("\nStatystyki dla danych użytych w ANOVA\n")
+    cat("(tylko kompletne przypadki)\n\n")
+  }
+  
+  temp_data <- df %>% 
+    filter(id_pomiaru %in% pomiar) %>% 
+    na.omit()
+  
+  if (!include_incomplete) {
+    # Filtruj tylko osoby z kompletnymi danymi
+    complete_ids <- temp_data %>% 
+      count(id_osoby) %>% 
+      filter(n == length(pomiar)) %>% 
+      pull(id_osoby)
+    
+    temp_data <- temp_data %>% 
+      filter(id_osoby %in% complete_ids)
+    
+    cat("Osoby z kompletnymi danymi:", length(complete_ids), "\n")
+    cat("Całkowita liczba obserwacji:", nrow(temp_data), "\n\n")
+  } else {
+    cat("Całkowita liczba obserwacji:", nrow(temp_data), "\n")
+    cat("Liczba unikalnych osób:", n_distinct(temp_data$id_osoby), "\n\n")
+  }
+  
+  stats <- temp_data %>% 
+    group_by(interwencja, id_pomiaru) %>% 
+    summarize(
+      n = n(),
+      psych::describe(zmienna, quant = c(.25, 0.5, .75), fast = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(across(mean:Q0.75, round, 3))
+  
+  print(knitr::kable(stats))
+  
+  return(invisible(stats))
+}
+
+# Funkcja do kompleksowego sprawdzenia założeń
+sprawdz_zalozenia <- function(temp_df, model, var_name) {
+  
+  cat("=" %R% 40, "\n")
+  cat("SPRAWDZENIE ZAŁOŻEŃ DLA:", var_name, "\n")
+  cat("=" %R% 40, "\n\n")
+  
+  # 1. NORMALNOŚĆ - per grupa i czas
+    cat("1. TEST NORMALNOŚCI SHAPIRO-WILKA (per grupa × czas)\n")
+    cat("   H0: Dane mają rozkład normalny (p > 0.05 = OK)\n\n")
+
+    shapiro_results <- temp_df %>%
+    group_by(interwencja, czas) %>%
+    summarize(
+        n = n(),
+        shapiro_W = shapiro.test(zmienna)$statistic,
+        shapiro_p = shapiro.test(zmienna)$p.value,
+        .groups = "drop"
+    ) %>%
+    mutate(normalny = if_else(shapiro_p > 0.05, "✓", "✗"))
+
+    print(knitr::kable(shapiro_results))
+
+    naruszen_normalnosci <- sum(shapiro_results$shapiro_p < 0.05, na.rm = TRUE)
+    cat("\nNaruszenia normalności:", naruszen_normalnosci, "/", nrow(shapiro_results), "\n")
+
+    if (naruszen_normalnosci > 0) {
+    cat("⚠ UWAGA: Wykryto naruszenia normalności.\n")
+    cat("   Rozważ transformację danych lub testy nieparametryczne.\n")
+    } else {
+    cat("✓ Wszystkie grupy mają rozkład normalny.\n")
+    }
+   
+  # 2. NORMALNOŚĆ RESZT
+
+  cat("\n2. NORMALNOŚĆ RESZT MODELU\n")
+  
+
+# Extract residuals properly from Error() model
+if (inherits(model, "aovlist")) {
+  # For Error() models, use lmer to get proper residuals
+  require(lme4)
+  lmer_model <- lmer(zmienna ~ interwencja * czas + (1|id_osoby), data = temp_df)
+  residuals_model <- residuals(lmer_model)
+} else {
+  residuals_model <- residuals(model)
+}
+
+# Check if we have valid residuals
+if (length(residuals_model) >= 3 && length(residuals_model) <= 5000) {
+  shapiro_resid <- shapiro.test(residuals_model)
+  cat("   Shapiro-Wilk W =", round(shapiro_resid$statistic, 4), 
+      "p =", round(shapiro_resid$p.value, 4), "\n")
+  cat("   ", ifelse(shapiro_resid$p.value > 0.05, "✓", "✗"), 
+      ifelse(shapiro_resid$p.value > 0.05, 
+             "Reszty mają rozkład normalny", 
+             "⚠ Reszty NIE mają rozkładu normalnego"), "\n")
+} else {
+  cat("   ⚠ Nie można wykonać testu Shapiro-Wilka (niewłaściwa liczba reszt)\n")
+}
+
+  
+  # 3. SFERYCZNOŚĆ (Mauchly's test)
+  cat("\n3. TEST SFERYCZNOŚCI MAUCHLY'EGO\n")
+  cat("   H0: Założenie sferyczności spełnione (p > 0.05 = OK)\n\n")
+  
+  sphericity <- anova_test(
+    data = temp_df,
+    dv = zmienna,
+    wid = id_osoby,
+    within = czas,
+    between = interwencja,
+    detailed = TRUE
+  )
+  
+  mauchly_results <- attr(sphericity$ANOVA, "sphericity.tests")
+  
+  if(!is.null(mauchly_results) && nrow(mauchly_results) > 0) {
+    print(mauchly_results)
+    
+    # Interpretacja
+    if(any(mauchly_results$p < 0.05, na.rm = TRUE)) {
+      cat("\n⚠ UWAGA: Naruszenie sferyczności!\n")
+      cat("   Korekcja Greenhouse-Geisser lub Huynh-Feldt zostanie zastosowana.\n")
+    } else {
+      cat("\n✓ Założenie sferyczności spełnione.\n")
+    }
+  } else {
+    cat("   Brak testu (prawdopodobnie < 3 poziomy czynnika wewnątrzgrupowego\n")
+    cat("   lub brak wystarczających danych do obliczenia testu)\n")
+  }
+  
+  # 4. HOMOGENICZNOŚĆ WARIANCJI (Levene)
+  cat("\n4. TEST HOMOGENICZNOŚCI WARIANCJI (LEVENE)\n")
+  cat("   H0: Wariancje są jednorodne (p > 0.05 = OK)\n\n")
+  
+  levene_results <- temp_df %>%
+  group_by(czas) %>%
+  summarize(
+    df1 = 2,
+    df2 = n() - 3,
+    statistic = car::leveneTest(zmienna ~ interwencja, data = cur_data())[[2]][1],
+    p = car::leveneTest(zmienna ~ interwencja, data = cur_data())[[3]][1],
+    .groups = "drop"
+  )
+
+  print(knitr::kable(levene_results))
+
+    if (all(levene_results$p > 0.05)) {
+    cat("\n✓ Założenie homogeniczności wariancji spełnione.\n")
+    } else {
+    cat("\n⚠ UWAGA: Naruszenie homogeniczności wariancji w niektórych punktach czasowych.\n")
+    }
+  
+  # 5. BOX'S M TEST (homogeniczność macierzy kowariancji)
+  cat("\n5. TEST BOX'S M (homogeniczność macierzy kowariancji)\n")
+    cat("   H0: Macierze kowariancji są jednorodne (p > 0.05 = OK)\n\n")
+
+    boxm_result <- tryCatch({
+    boxm_test <- heplots::boxM(
+        Y = temp_df %>% select(zmienna) %>% as.matrix(),
+        group = temp_df$interwencja
+    )
+    
+    result_df <- tibble(
+        statistic = boxm_test$statistic,
+        p.value = boxm_test$p.value,
+        parameter = boxm_test$parameter,
+        method = boxm_test$method
+    )
+    
+    print(result_df)
+    
+    if(boxm_test$p.value > 0.05) {
+        cat("\n✓ Macierze kowariancji są jednorodne.\n")
+    } else {
+        cat("\n⚠ UWAGA: Naruszenie homogeniczności macierzy kowariancji.\n")
+        cat("   MANOVA może być mniej odpowiednia.\n")
+    }
+    
+    boxm_test
+    }, error = function(e) {
+    cat("⚠ Nie można przeprowadzić testu Box'a M:\n")
+    cat("  ", e$message, "\n")
+    NULL
+    })
+  
+  # 6. DIAGNOSTYKA GRAFICZNA
+  # Extract residuals and fitted values from aovlist
+if (inherits(model, "aovlist")) {
+  within_component <- model[[length(model)]]
+  residuals_model <- residuals(within_component)
+  fitted_vals <- fitted(within_component)
+} else {
+  residuals_model <- residuals(model)
+  fitted_vals <- fitted(model)
+}
+
+# Check if both are available and have matching lengths
+if (is.null(residuals_model) || is.null(fitted_vals) || 
+    length(residuals_model) != length(fitted_vals)) {
+  cat("⚠ Nie można utworzyć wykresów diagnostycznych dla tego modelu.\n")
+} else {
+  plot_data <- data.frame(
+    fitted = fitted_vals,
+    residuals = residuals_model
+  )
+  
+  # Q-Q plot
+  p_qq <- ggplot(plot_data, aes(sample = residuals)) +
+    stat_qq() +
+    stat_qq_line(color = "red") +
+    labs(
+      title = "Q-Q Plot reszt modelu",
+      x = "Kwantyle teoretyczne",
+      y = "Kwantyle empiryczne"
+    ) +
+    theme_minimal()
+  
+  # Residuals vs Fitted
+  p_resid <- ggplot(plot_data, aes(x = fitted, y = residuals)) +
+    geom_point() +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    geom_smooth(se = FALSE, color = "blue") +
+    labs(
+      title = "Reszty vs Wartości dopasowane",
+      x = "Wartości dopasowane",
+      y = "Reszty"
+    ) +
+    theme_minimal()
+  
+  gridExtra::grid.arrange(p_qq, p_resid, ncol = 2)
+}  
+
+  
+    # ================================================================================ 
+    # PODSUMOWANIE ZAŁOŻEŃ
+    # ================================================================================ 
+
+    cat("=" %R% 40, "\n")
+    cat("PODSUMOWANIE ZAŁOŻEŃ\n")
+    cat("=" %R% 40, "\n\n")
+
+    wyniki_zalozenia <- list(
+    normalnosc_per_grupa = shapiro_results,
+    normalnosc_reszt = if(exists("shapiro_residuals")) shapiro_residuals else NA,
+    sferyctnosc = mauchly_results,
+    homogenicznosc_wariancji = levene_results,
+    homogenicznosc_macierzy = boxm_result
+    )
+
+    # Podsumowanie naruszenia
+    naruszen <- 0
+
+    # Check group-wise normality
+    if(any(shapiro_results$shapiro_p < 0.05, na.rm = TRUE)) naruszen <- naruszen + 1
+
+    # Check residuals normality - safely extract p-value
+    if(exists("shapiro_residuals") && !is.null(shapiro_residuals) && 
+    is.list(shapiro_residuals) && !is.null(shapiro_residuals$p.value)) {
+    if(shapiro_residuals$p.value < 0.05) naruszen <- naruszen + 1
+    }
+
+    # Check homogeneity of variance
+    if(!is.null(levene_results) && any(levene_results$p < 0.05, na.rm = TRUE)) {
+    naruszen <- naruszen + 1
+    }
+
+    # Check Box's M
+    if(!is.null(boxm_result) && is.list(boxm_result) && !is.null(boxm_result$p.value)) {
+    if(boxm_result$p.value < 0.05) naruszen <- naruszen + 1
+    }
+
+    cat("Liczba naruszonych założeń:", naruszen, "\n")
+
+    if(naruszen == 0) {
+    cat("✓ Wszystkie założenia spełnione - można przeprowadzić ANOVA z powtarzanymi pomiarami.\n")
+    } else if(naruszen <= 2) {
+    cat("⚠ Niewielkie naruszenia założeń - ANOVA może być nadal odpowiednia (jest odporna).\n")
+    } else {
+    cat("✗ Poważne naruszenia założeń - rozważ transformację danych lub testy nieparametryczne.\n")
+    }
+
+    cat("\n")
+
+    return(invisible(wyniki_zalozenia))
+
+}
+
+
+```
+
+
+
+
+```{r data-structure, include=FALSE}
+## Podsumowanie struktury danych
+
+# cat("=" %R% 80, "\n")
+# cat("INFORMACJE O STRUKTURZE DANYCH\n")
+# cat("=" %R% 80, "\n\n")
+
+# cat("Struktura pomiarów:\n")
+# cat("- Pomiar 1: początek (0 tygodni)\n")
+# cat("- Pomiar 2: 6 tygodni\n")
+# cat("- Pomiar 3: 12 tygodni\n")
+# cat("- Pomiar 4: 16 tygodni\n\n")
+
+# cat("Grupy interwencji:\n")
+# cat("- Grupa 1: aerobowa\n")
+# cat("- Grupa 2: siłowa\n")
+# cat("- Grupa 3: kontrolna\n\n")
+
+# # Kompletność danych - podsumowanie per zmienna
+# cat("KOMPLETNOŚĆ DANYCH:\n\n")
+
+# # Dla każdej zmiennej numerycznej
+# numeric_vars <- df %>% 
+#   select(where(is.numeric), -id_osoby, -id_pomiaru) %>% 
+#   names()
+
+# for(var in numeric_vars) {
+#   cat("Zmienna:", var, "\n")
+  
+#   # Zlicz osoby z różną liczbą pomiarów
+#   completeness <- df %>% 
+#     select(id_osoby, id_pomiaru, interwencja, zmienna = !!sym(var)) %>%
+#     na.omit() %>% 
+#     count(id_osoby, interwencja) %>% 
+#     count(interwencja, n, name = "liczba_osob") %>% 
+#     rename(liczba_pomiarow = n)
+  
+#   print(completeness)
+  
+#   # Osoby z kompletnymi danymi
+#   complete_cases <- df %>% 
+#     select(id_osoby, id_pomiaru, interwencja, zmienna = !!sym(var)) %>%
+#     na.omit() %>% 
+#     count(id_osoby) %>% 
+#     filter(n == 4) %>% 
+#     nrow()
+  
+#   total_cases <- n_distinct(df$id_osoby[!is.na(df[[var]])])
+  
+#   cat("Osoby z kompletnymi danymi (4 pomiary):", complete_cases, "/", total_cases, 
+#       sprintf("(%.1f%%)", 100 * complete_cases / total_cases), "\n\n")
+# }
+
+# cat("=" %R% 80, "\n\n")
+
+```
+
+
+
+```{r}
+# Definiuj pomiary
+pomiar <- c(1, 2, 3, 4)
+
+cat("\n\n")
+cat("#" %R% 40, "\n")
+cat("# ANALIZA ZMIENNEJ:", toupper(var), "\n")
+cat("#" %R% 40, "\n\n")
+```
+
+### Statystyki opisowe
+
+```{r}
+# Przygotuj dane
+temp_all <- df %>% 
+  dplyr::select(czas, interwencja, id_pomiaru, id_osoby, zmienna = !! sym(var))
+
+# Statystyki dla wszystkich dostępnych pomiarów
+stat_opisowa_zal(temp_all, pomiar = pomiar, var_name = var, include_incomplete = TRUE)
+```
+
+### Przygotowanie danych do ANOVA
+
+```{r}
+cat("\nPRZYGOTOWANIE DANYCH DO ANOVA\n")
+
+# Dane do ANOVA - tylko kompletne przypadki
+temp_df <- df %>% 
+  dplyr::select(czas, interwencja, id_pomiaru, id_osoby, zmienna = !! sym(var)) %>%
+  na.omit() %>% 
+  add_count(id_osoby) %>% 
+  filter(n == length(pomiar)) %>%  # tylko osoby ze wszystkimi pomiarami
+  dplyr::select(-n)
+
+# Informacje o wykluczonych osobach
+all_ids <- unique(df$id_osoby[!is.na(df[[var]])])
+complete_ids <- unique(temp_df$id_osoby)
+excluded_ids <- setdiff(all_ids, complete_ids)
+
+cat("Całkowita liczba osób z jakimikolwiek danymi:", length(all_ids), "\n")
+cat("Osoby z kompletnymi danymi (użyte w ANOVA):", length(complete_ids), "\n")
+cat("Osoby wykluczone z powodu braków:", length(excluded_ids), "\n")
+
+if(length(excluded_ids) > 0) {
+  cat("\nID wykluczonych osób:", paste(excluded_ids, collapse = ", "), "\n")
+}
+
+cat("\nRozkład osób per grupa (w ANOVA):\n")
+print(table(temp_df %>% distinct(id_osoby, interwencja) %>% pull(interwencja)))
+```
+
+### Statystyki opisowe - dane do ANOVA
+
+```{r}
+stat_opisowa_zal(temp_df, pomiar = pomiar, var_name = var, include_incomplete = FALSE)
+```
+
+
+### Wizualizacja danych
+
+```{r}
+cat("\nWIZUALIZACJA DANYCH\n\n")
+
+# Wykres pudełkowy
+p_box <- ggplot(temp_df, aes(x = czas, y = zmienna, fill = interwencja)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 1) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), 
+             alpha = 0.3, size = 1) +
+  labs(
+    title = paste0("Rozkład wartości: ", var),
+    subtitle = "Dane z powtarzanymi pomiarami",
+    x = "Punkt czasowy",
+    y = var,
+    fill = "Interwencja"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# Wykres linii dla poszczególnych osób
+p_lines <- ggplot(temp_df, aes(x = czas, y = zmienna, group = id_osoby, color = interwencja)) +
+  geom_line(alpha = 0.3) +
+  geom_point(alpha = 0.3, size = 1) +
+  facet_wrap(~interwencja, ncol = 3) +
+  labs(
+    title = paste0("Profile indywidualne: ", var),
+    x = "Punkt czasowy",
+    y = var,
+    color = "Interwencja"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Wykres średnich z błędami standardowymi
+p_means <- temp_df %>%
+  group_by(interwencja, czas) %>%
+  summarise(
+    mean = mean(zmienna, na.rm = TRUE),
+    se = sd(zmienna, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = czas, y = mean, group = interwencja, color = interwencja)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, linewidth = 0.8) +
+  labs(
+    title = paste0("Średnie wartości z SE: ", var),
+    x = "Punkt czasowy",
+    y = paste0("Średnia ", var),
+    color = "Interwencja"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# Wyświetl wykresy
+print(p_box)
+print(p_lines)
+print(p_means)
+```
+
+### Sprawdzenie założeń ANOVA
+
+```{r}
+# Budowa modelu do sprawdzenia założeń
+model <- aov(zmienna ~ interwencja * czas + Error(id_osoby/czas), data = temp_df)
+
+# Kompleksowe sprawdzenie założeń
+zalozenia_results <- sprawdz_zalozenia(temp_df, model, var)
+
+```
+
+## ANOVA z powtarzanymi pomiarami
+
+```{r}
+cat("=" %R% 40, "\n")
+cat("ANOVA Z POWTARZANYMI POMIARAMI\n")
+cat("=" %R% 40, "\n\n")
+
+cat("Model: zmienna ~ interwencja × czas\n")
+cat("Czynnik wewnątrzgrupowy: czas (4 poziomy)\n")
+cat("Czynnik międzygrupowy: interwencja (3 poziomy)\n\n")
+
+# Walidacja danych przed ANOVA
+cat("Sprawdzanie struktury danych...\n")
+cat("- Liczba unikalnych osób:", n_distinct(temp_df$id_osoby), "\n")
+
+# Sprawdź czy każda osoba ma wszystkie pomiary
+obs_per_person <- temp_df %>%
+  count(id_osoby) %>%
+  pull(n)
+
+if(!all(obs_per_person == length(unique(temp_df$czas)))) {
+  warning("⚠ Nie wszystkie osoby mają komplet pomiarów!")
+}
+
+cat("\n")
+
+
+
+# ANOVA z automatyczną korekcją dla sferyczności
+aov.res <- anova_test(
+  data = temp_df,
+  dv = zmienna,
+  wid = id_osoby,
+  within = czas,
+  between = interwencja,
+  effect.size = "ges",  # generalized eta squared
+  detailed = FALSE
+)
+
+# Wyświetl wyniki
+cat("WYNIKI ANOVA:\n\n")
+print(knitr::kable(get_anova_table(aov.res, correction = "auto")))
+
+# Interpretacja wielkości efektów
+cat("\n\nINTERPRETACJA WIELKOŚCI EFEKTÓW (ges):\n")
+cat("- < 0.01: znikomy\n")
+cat("- 0.01-0.06: mały\n")
+cat("- 0.06-0.14: średni\n")
+cat("- > 0.14: duży\n\n")
+
+# Dodatkowe informacje o korekcji
+cat("INFORMACJE O KOREKCJI:\n")
+if(!is.null(attr(get_anova_table(aov.res), "correction"))) {
+  cat("Zastosowana korekcja:", attr(get_anova_table(aov.res), "correction"), "\n")
+} else {
+  cat("Brak korekcji (założenie sferyczności spełnione)\n")
+}
+
+cat("=" %R% 40, "\n\n")
+```
+
+## Analiza post-hoc z wielkościami efektów
+
+
+```{r fig.width=12, fig.height=8}
+# Sprawdź czy interakcja jest istotna
+interaction_p <- aov.res$ANOVA$p[aov.res$ANOVA$Effect == "interwencja:czas"]
+
+if(interaction_p < 0.05){
+  
+  cat("\nANALIZA POST-HOC\n")
+  cat("Interakcja interwencja:czas jest istotna (p =", round(interaction_p, 4), ")\n")
+  cat("Przeprowadzam porównania wielokrotne z korektą Bonferroniego...\n\n")
+  
+  # 1. Porównania między grupami w każdym czasie
+  cat("=" %R% 40, "\n")
+  cat("1. PORÓWNANIA MIĘDZY GRUPAMI w każdym punkcie czasowym\n")
+  cat("=" %R% 40, "\n\n")
+  
+  pwc_between <- temp_df %>%
+    group_by(czas) %>%
+    emmeans_test(
+      zmienna ~ interwencja, 
+      p.adjust.method = "bonferroni",
+      detailed = TRUE
+    )
+  
+  # Dodaj wielkości efektów (Cohen's d)
+  cat("Obliczam wielkości efektów (Cohen's d)...\n\n")
+  
+  effect_sizes_between <- temp_df %>%
+  group_by(czas) %>%
+  group_split() %>%
+  map_dfr(function(df_time) {
+    czas_val <- unique(df_time$czas)
+    
+    # Explicitly extract numeric vectors for each group
+    grupy <- unique(df_time$interwencja)
+    val1 <- df_time$zmienna[df_time$interwencja == grupy[1]]
+    val2 <- df_time$zmienna[df_time$interwencja == grupy[2]]
+    
+    # Calculate Cohen's d manually or use cohens_d with vectors
+    result <- cohens_d(val1, val2, paired = FALSE)
+    
+    # Add metadata
+    result$czas <- czas_val
+    result$group1 <- grupy[1]
+    result$group2 <- grupy[2]
+    
+    result
+  }) %>%
+  mutate(
+    magnitude = case_when(
+      abs(Cohens_d) < 0.2 ~ "znikomy",
+      abs(Cohens_d) < 0.5 ~ "mały",
+      abs(Cohens_d) < 0.8 ~ "średni",
+      TRUE ~ "duży"
+    )
+  )
+  
+
+
+
+  # Połącz wyniki
+  pwc_between_full <- pwc_between %>%
+  left_join(
+    effect_sizes_between %>%
+      select(czas, group1, group2, Cohens_d, magnitude),
+    by = c("czas", "group1", "group2")
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+  
+  print(knitr::kable(pwc_between_full))
+
+  
+
+# 2. Porównania między czasami w każdej grupie
+cat("=" %R% 40, "\n")
+cat("2. PORÓWNANIA W OBRĘBIE GRUP (zmiany w czasie)\n")
+cat("=" %R% 40, "\n\n")
+
+pwc_within <- temp_df %>%
+  group_by(interwencja) %>%
+  emmeans_test(
+    zmienna ~ czas,
+    p.adjust.method = "bonferroni",
+    detailed = TRUE
+  )
+
+# Dodaj wielkości efektów dla porównań w czasie
+cat("Obliczam wielkości efektów dla porównań w czasie...\n\n")
+
+effect_sizes_within <- temp_df %>%
+  group_by(interwencja, czas) %>%
+  summarize(zmienna = list(zmienna), .groups = "drop") %>%
+  pivot_wider(names_from = czas, values_from = zmienna) %>%
+  group_by(interwencja) %>%
+  group_split() %>%
+  map_dfr(function(df_group) {
+    grupa_val <- df_group$interwencja[1]
+    
+    # Get column names (time points)
+    czasy <- setdiff(names(df_group), "interwencja")
+    
+    # Calculate effect sizes for all pairs
+    pairs <- combn(czasy, 2, simplify = FALSE)
+    
+    map_dfr(pairs, function(pair) {
+      val1 <- unlist(df_group[[pair[1]]])
+      val2 <- unlist(df_group[[pair[2]]])
+      
+      # Calculate paired Cohen's d
+      result <- cohens_d(val1, val2, paired = TRUE)
+      
+      # Add metadata
+      result$interwencja <- grupa_val
+      result$group1 <- pair[1]
+      result$group2 <- pair[2]
+      
+      result
+    })
+  }) %>%
+  mutate(
+    magnitude = case_when(
+      abs(Cohens_d) < 0.2 ~ "znikomy",
+      abs(Cohens_d) < 0.5 ~ "mały",
+      abs(Cohens_d) < 0.8 ~ "średni",
+      TRUE ~ "duży"
+    )
+  )
+
+# Połącz wyniki
+pwc_within_summary <- pwc_within %>%
+  left_join(
+    effect_sizes_within %>%
+      select(interwencja, group1, group2, Cohens_d, magnitude),
+    by = c("interwencja", "group1", "group2")
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+print(knitr::kable(pwc_within_summary))
+  
+  # 3. Wizualizacja wielkości efektów
+  cat("\nWIZUALIZACJA WIELKOŚCI EFEKTÓW\n\n")
+  
+  # Wykres dla porównań między grupami
+  p_effect_between <- ggplot(effect_sizes_between, aes(x = czas, y = Cohens_d, color = magnitude)) +
+  geom_point(size = 4) +
+  geom_hline(yintercept = c(-0.8, -0.5, -0.2, 0.2, 0.5, 0.8), 
+             linetype = "dashed", alpha = 0.3) +
+  labs(
+    title = "Wielkości efektów (Cohen's d) - porównania między grupami",
+    x = "Punkt czasowy",
+    y = "Cohen's d",
+    color = "Wielkość efektu"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_effect_between)
+  
+  # Wykres dla porównań wewnątrzgrupowych
+  p_effect_within <- ggplot(effect_sizes_within, 
+                          aes(x = paste(group1, "→", group2), y = Cohens_d, fill = magnitude)) +
+  geom_col() +
+  geom_hline(yintercept = c(-0.8, -0.5, -0.2, 0.2, 0.5, 0.8), 
+             linetype = "dashed", alpha = 0.3) +
+  facet_wrap(~interwencja, scales = "free_x") +
+  labs(
+    title = "Wielkości efektów (Cohen's d) - porównania w obrębie grup (w czasie)",
+    x = "Porównanie",
+    y = "Cohen's d",
+    fill = "Wielkość efektu"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_effect_within)
+  
+  # 4. Profile plot z przedziałami ufności (emmeans)
+  cat("\nPROFILE PLOT Z PRZEDZIAŁAMI UFNOŚCI\n\n")
+  
+  # Oblicz emmeans
+  emm <- emmeans(aov(zmienna ~ interwencja * czas, data = temp_df), 
+                 ~ interwencja | czas)
+  
+  # Wykres profile z emmeans
+  p_profile <- emmip(emm, interwencja ~ czas, CIs = TRUE) +
+    geom_point(size = 3) +
+    labs(
+      title = paste0("Średnie brzegowe z 95% CI: ", var),
+      x = "Punkt czasowy",
+      y = paste0("Średnia ", var),
+      color = "Interwencja"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p_profile)
+  
+} else {
+  
+  cat("\n✓ Interakcja interwencja:czas NIE jest istotna (p =", round(interaction_p, 4), ")\n")
+  cat("Sprawdzam efekty główne...\n\n")
+  
+  # Sprawdź efekt czasu
+  czas_p <- aov.res$ANOVA$p[aov.res$ANOVA$Effect == "czas"]
+  
+  if(czas_p < 0.05){
+    cat("=" %R% 40, "\n")
+    cat("EFEKT GŁÓWNY: CZAS (p =", round(czas_p, 4), ")\n")
+    cat("=" %R% 40, "\n\n")
+    
+    # Post-hoc dla czasu
+pwc_czas <- temp_df %>%
+  emmeans_test(
+    zmienna ~ czas, 
+    p.adjust.method = "bonferroni",
+    detailed = TRUE
+  )
+
+# Wielkości efektów - oblicz dla każdej pary czasów
+cat("Obliczam wielkości efektów dla porównań w czasie...\n\n")
+
+effect_czas <- temp_df %>%
+  pivot_wider(
+    id_cols = id_osoby,
+    names_from = czas,
+    values_from = zmienna
+  ) %>%
+  {
+    czasy <- setdiff(names(.), "id_osoby")
+    pairs <- combn(czasy, 2, simplify = FALSE)
+    
+    map_dfr(pairs, function(pair) {
+      val1 <- pull(., pair[1])
+      val2 <- pull(., pair[2])
+      
+      result <- cohens_d(val1, val2, paired = TRUE)
+      
+      result %>%
+        mutate(
+          group1 = pair[1],
+          group2 = pair[2],
+          magnitude = case_when(
+            abs(Cohens_d) < 0.2 ~ "znikomy",
+            abs(Cohens_d) < 0.5 ~ "mały",
+            abs(Cohens_d) < 0.8 ~ "średni",
+            TRUE ~ "duży"
+          )
+        )
+    })
+  }
+
+pwc_czas_full <- pwc_czas %>%
+  left_join(
+    effect_czas %>% select(group1, group2, Cohens_d, magnitude),
+    by = c("group1", "group2")
+  ) %>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
+
+print(knitr::kable(pwc_czas_full))
+    
+    # Wykres efektu czasu
+    p_czas <- temp_df %>%
+      group_by(czas) %>%
+      summarise(
+        mean = mean(zmienna, na.rm = TRUE),
+        se = sd(zmienna, na.rm = TRUE) / sqrt(n()),
+        .groups = "drop"
+      ) %>%
+      ggplot(aes(x = czas, y = mean)) +
+      geom_line(aes(group = 1), linewidth = 1) +
+      geom_point(size = 3) +
+      geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+      labs(
+        title = paste0("Efekt główny czasu: ", var),
+        x = "Punkt czasowy",
+        y = paste0("Średnia ", var, " ± SE")
+      ) +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    print(p_czas)
+  }
+  
+  # Sprawdź efekt interwencji
+  interwencja_p <- aov.res$ANOVA$p[aov.res$ANOVA$Effect == "interwencja"]
+
+if(interwencja_p < 0.05){
+  cat("=" %R% 40, "\n")
+  cat("EFEKT GŁÓWNY: INTERWENCJA (p =", round(interwencja_p, 4), ")\n")
+  cat("=" %R% 40, "\n\n")
+  
+  # Post-hoc dla interwencji
+  pwc_int <- temp_df %>%
+    emmeans_test(
+      zmienna ~ interwencja, 
+      p.adjust.method = "bonferroni",
+      detailed = TRUE
+    )
+  
+  # Wielkości efektów - oblicz dla każdej pary grup
+  cat("Obliczam wielkości efektów dla porównań między grupami...\n\n")
+  
+  effect_int <- temp_df %>%
+    group_by(interwencja) %>%
+    summarize(zmienna = list(zmienna), .groups = "drop") %>%
+    {
+      grupy <- pull(., interwencja)
+      pairs <- combn(as.character(grupy), 2, simplify = FALSE)
+      
+      map_dfr(pairs, function(pair) {
+        val1 <- unlist(filter(., interwencja == pair[1])$zmienna)
+        val2 <- unlist(filter(., interwencja == pair[2])$zmienna)
+        
+        result <- cohens_d(val1, val2, paired = FALSE)
+        
+        result %>%
+          mutate(
+            group1 = pair[1],
+            group2 = pair[2],
+            magnitude = case_when(
+              abs(Cohens_d) < 0.2 ~ "znikomy",
+              abs(Cohens_d) < 0.5 ~ "mały",
+              abs(Cohens_d) < 0.8 ~ "średni",
+              TRUE ~ "duży"
+            )
+          )
+      })
+    }
+  
+  pwc_int_full <- pwc_int %>%
+    left_join(
+      effect_int %>% select(group1, group2, Cohens_d, magnitude),
+      by = c("group1", "group2")
+    ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 4)))
+  
+  print(knitr::kable(pwc_int_full))
+  
+  # Wykres efektu interwencji
+  p_int <- temp_df %>%
+    group_by(interwencja) %>%
+    summarise(
+      mean = mean(zmienna, na.rm = TRUE),
+      se = sd(zmienna, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    ggplot(aes(x = interwencja, y = mean, fill = interwencja)) +
+    geom_col(alpha = 0.7) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    labs(
+      title = paste0("Efekt główny interwencji: ", var),
+      x = "Interwencja",
+      y = paste0("Średnia ", var, " ± SE")
+    ) +
+    theme_bw() +
+    theme(legend.position = "none")
+  
+  print(p_int)
+}
+  
+  # Jeśli żaden efekt nie jest istotny
+  if(czas_p >= 0.05 && interwencja_p >= 0.05){
+    cat("\n⚠ Brak istotnych efektów głównych.\n")
+    cat("Nie przeprowadzam analiz post-hoc.\n\n")
+  }
+}
+```
+
+### Analiza mocy (post-hoc)
+
+
+```{r}
+cat("=" %R% 40, "\n")
+cat("ANALIZA MOCY POST-HOC\n")
+cat("=" %R% 40, "\n\n")
+
+# Informacje o próbie
+cat("Liczebność grup:\n")
+print(temp_df %>% 
+        distinct(id_osoby, interwencja) %>% 
+        count(interwencja))
+
+cat("\nLiczba pomiarów powtarzanych:", length(unique(temp_df$czas)), "\n")
+cat("Całkowita liczba obserwacji:", nrow(temp_df), "\n\n")
+
+# Oblicz wielkości efektów z ANOVA
+ges_int <- aov.res$ANOVA$ges[aov.res$ANOVA$Effect == "interwencja"]
+ges_czas <- aov.res$ANOVA$ges[aov.res$ANOVA$Effect == "czas"]
+ges_interaction <- aov.res$ANOVA$ges[aov.res$ANOVA$Effect == "interwencja:czas"]
+
+cat("Wykryte wielkości efektów (generalized eta squared):\n")
+cat("- Interwencja:", round(ges_int, 4), "\n")
+cat("- Czas:", round(ges_czas, 4), "\n")
+cat("- Interakcja:", round(ges_interaction, 4), "\n\n")
+
+# Konwersja ges na f (dla analizy mocy)
+# f = sqrt(ges / (1 - ges))
+f_int <- sqrt(ges_int / (1 - ges_int))
+f_czas <- sqrt(ges_czas / (1 - ges_czas))
+f_interaction <- sqrt(ges_interaction / (1 - ges_interaction))
+
+cat("Wielkości efektów f (dla analizy mocy):\n")
+cat("- Interwencja: f =", round(f_int, 4), "\n")
+cat("- Czas: f =", round(f_czas, 4), "\n")
+cat("- Interakcja: f =", round(f_interaction, 4), "\n\n")
+
+# Interpretacja wielkości efektów f
+interpret_f <- function(f_value) {
+  if(f_value < 0.10) return("znikomy")
+  if(f_value < 0.25) return("mały")
+  if(f_value < 0.40) return("średni")
+  return("duży")
+}
+
+cat("Interpretacja (Cohen):\n")
+cat("- Interwencja:", interpret_f(f_int), "\n")
+cat("- Czas:", interpret_f(f_czas), "\n")
+cat("- Interakcja:", interpret_f(f_interaction), "\n\n")
+
+# Oszacowanie mocy dla wykrytych efektów
+library(pwr)
+
+# Liczba grup
+k <- length(unique(temp_df$interwencja))
+# Liczba pomiarów
+n_measures <- length(unique(temp_df$czas))
+# Średnia liczebność grupy
+n_mean <- mean(table(temp_df %>% distinct(id_osoby, interwencja) %>% pull(interwencja)))
+
+cat("Parametry badania:\n")
+cat("- Liczba grup (k):", k, "\n")
+cat("- Liczba pomiarów powtarzanych:", n_measures, "\n")
+cat("- Średnia liczebność grupy:", round(n_mean, 1), "\n")
+cat("- Poziom istotności (alpha):", 0.05, "\n\n")
+
+# Przybliżona moc dla efektu między grupami (interwencja)
+# Używamy testu ANOVA one-way jako przybliżenia
+tryCatch({
+  pwr_between <- pwr.anova.test(
+    k = k,
+    n = n_mean,
+    f = f_int,
+    sig.level = 0.05
+  )
+  
+  cat("Oszacowana moc dla efektu INTERWENCJI:\n")
+  cat("- Moc (power):", round(pwr_between$power, 4), 
+      sprintf("(%.1f%%)", 100 * pwr_between$power), "\n")
+  
+  if(pwr_between$power < 0.80) {
+    cat("  ⚠ Moc < 0.80: badanie może być niedostatecznie mocne\n")
+    # Oblicz potrzebną liczebność dla mocy 0.80
+    pwr_needed <- pwr.anova.test(
+      k = k,
+      f = f_int,
+      sig.level = 0.05,
+      power = 0.80
+    )
+    cat("  Potrzebna liczebność per grupa dla mocy 0.80:", 
+        ceiling(pwr_needed$n), "\n")
+  } else {
+    cat("  ✓ Moc >= 0.80: wystarczająca do wykrycia tego efektu\n")
+  }
+}, error = function(e) {
+  cat("Nie można obliczyć mocy dla efektu interwencji\n")
+})
+
+cat("\n")
+
+# Uwagi dotyczące mocy dla powtarzanych pomiarów
+cat("UWAGI:\n")
+cat("- Powyższe oszacowanie mocy jest przybliżone\n")
+cat("- Modele z powtarzanymi pomiarami mają większą moc niż ANOVA between-subjects\n")
+cat("- Moc zależy od korelacji między pomiarami (nie uwzględniona w obliczeniach)\n")
+
+cat("\n", "=" %R% 40, "\n\n")
+```
+
+
+## Podsumowanie wyników 
+
+
+```{r}
+cat("#" %R% 40, "\n")
+cat("# PODSUMOWANIE ANALIZY DLA ZMIENNEJ:", toupper(var), "\n")
+cat("#" %R% 40, "\n\n")
+
+cat("1. PRÓBA:\n")
+cat("   - Osoby z kompletnymi danymi:", n_distinct(temp_df$id_osoby), "\n")
+cat("   - Całkowita liczba obserwacji:", nrow(temp_df), "\n")
+cat("   - Rozkład per grupa:\n")
+print(temp_df %>% distinct(id_osoby, interwencja) %>% count(interwencja))
+
+cat("\n2. ZAŁOŻENIA:\n")
+n_norm_violations <- sum(zalozenia_results$normalnosc_per_grupa$shapiro_p < 0.05)
+n_levene_violations <- sum(zalozenia_results$homogenicznosc_wariancji$p < 0.05)
+
+if(n_norm_violations == 0) {
+  cat("   ✓ Normalność: spełniona\n")
+} else {
+  cat("   ✗ Normalność: naruszona w", n_norm_violations, "grupach\n")
+}
+
+# Check residuals normality safely
+if(!is.null(zalozenia_results$normalnosc_reszt) && 
+   is.list(zalozenia_results$normalnosc_reszt) &&
+   !is.null(zalozenia_results$normalnosc_reszt$p.value)) {
+  if(zalozenia_results$normalnosc_reszt$p.value > 0.05) {
+    cat("   ✓ Normalność reszt: spełniona\n")
+  } else {
+    cat("   ✗ Normalność reszt: naruszona\n")
+  }
+} else {
+  cat("   ⚠ Normalność reszt: nie można ocenić\n")
+}
+
+if(n_levene_violations == 0) {
+  cat("   ✓ Homogeniczność wariancji: spełniona\n")
+} else {
+  cat("   ✗ Homogeniczność wariancji: naruszona w", n_levene_violations, "punktach\n")
+}
+
+cat("\n3. WYNIKI ANOVA:\n")
+anova_table <- get_anova_table(aov.res, correction = "auto")
+for(i in 1:nrow(anova_table)) {
+  effect <- anova_table$Effect[i]
+  p_val <- anova_table$p[i]
+  ges_val <- anova_table$ges[i]
+  sig <- ifelse(p_val < 0.05, "***", "ns")
+  
+  cat(sprintf("   - %-20s p = %.4f %s (ges = %.3f)\n", 
+              paste0(effect, ":"), p_val, sig, ges_val))
+}
+
+cat("\n4. INTERPRETACJA:\n")
+
+if(interaction_p < 0.05) {
+  cat("   Istotna interakcja interwencja × czas\n")
+  cat("   → Efekt interwencji zależy od punktu czasowego\n")
+  cat("   → Zobacz szczegółowe porównania post-hoc powyżej\n")
+} else {
+  cat("   ✓ Brak istotnej interakcji\n")
+  
+  if(interwencja_p < 0.05) {
+    cat("  Istotny efekt główny interwencji\n")
+    cat("   → Grupy różnią się niezależnie od czasu\n")
+  } else {
+    cat("   ✓ Brak efektu głównego interwencji\n")
+  }
+  
+  if(czas_p < 0.05) {
+    cat("  Istotny efekt główny czasu\n")
+    cat("   → Zmiany w czasie niezależnie od grupy\n")
+  } else {
+    cat("   ✓ Brak efektu głównego czasu\n")
+  }
+  
+  if(interwencja_p >= 0.05 && czas_p >= 0.05) {
+    cat("   → Brak istotnych różnic między grupami ani w czasie\n")
+  }
+}
+
+cat("\n", "#" %R% 40, "\n\n")
+```
+
