@@ -1,0 +1,148 @@
+---
+title: "Raport LMM dla jednej zmiennej"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    df-print: paged
+params:
+  variable: "homa_b"
+  data_path: "Dane/2025_11_23_publikacja.xlsx"
+  sheet: 1
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+pipeline_candidates <- c(
+  "lmm_pipeline_2025_11.R",
+  "szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R",
+  "../szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R",
+  "../../szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R",
+  "../../../szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R"
+)
+
+pipeline_path <- pipeline_candidates[file.exists(pipeline_candidates)][[1]]
+source(pipeline_path)
+
+data_path <- resolve_existing_path_2025_11(params$data_path)
+analysis <- run_lmm_analysis_2025_11(
+  var = params$variable,
+  data_path = data_path,
+  sheet = params$sheet
+)
+```
+
+## Opis analizy
+
+```{r}
+meta <- analysis$meta
+
+cat("Zmienna:", meta$display_label[[1]], "\n")
+cat("Kolumna:", meta$variable[[1]], "\n")
+cat("Skala analizy:", meta$analysis_scale[[1]], "\n")
+cat("Transformacja:", meta$transform_note[[1]], "\n")
+```
+
+Analiza glowna jest liniowym modelem mieszanym:
+
+```r
+y ~ interwencja * czas + (1 | id_osoby)
+```
+
+Modele sa estymowane metoda ML (`REML = FALSE`). Efekty omnibus sa oceniane przez porownania modeli zagniezdzonych (LRT). Porownania post hoc sa oparte na srednich marginalnych z modelu (`emmeans`) i korygowane metoda Holma w ramach rodziny porownan.
+
+## Proba i kompletnosc danych
+
+```{r}
+knitr::kable(analysis$sample_summary)
+```
+
+```{r}
+knitr::kable(analysis$completeness)
+```
+
+## Statystyki opisowe
+
+Statystyki opisowe liczone sa na wszystkich obserwacjach niebrakujacych dla tej zmiennej, czyli na danych faktycznie dostepnych dla modelu LMM.
+
+```{r}
+knitr::kable(analysis$descriptives)
+```
+
+## Wyniki LMM
+
+```{r}
+omnibus_display <- analysis$omnibus %>%
+  dplyr::mutate(
+    p = vapply(.data$p_value, fmt_p_2025_11, FUN.VALUE = character(1))
+  ) %>%
+  dplyr::select(.data$efekt, .data$chisq, .data$df, p, .data$istotny)
+
+knitr::kable(omnibus_display, digits = 4)
+```
+
+```{r}
+cat(paste(build_result_summary_2025_11(analysis), collapse = "\n"))
+```
+
+## Srednie modelowe
+
+```{r}
+model_means_display <- analysis$model_means %>%
+  dplyr::select(
+    .data$interwencja,
+    .data$czas,
+    .data$emmean,
+    .data$SE,
+    .data$lower.CL,
+    .data$upper.CL,
+    .data$mean_display,
+    .data$lower_display,
+    .data$upper_display
+  )
+
+knitr::kable(model_means_display, digits = 4)
+```
+
+## Post hoc
+
+```{r}
+if (length(analysis$posthoc$tables) == 0) {
+  cat("Brak porownan post hoc do raportowania przy przyjetym progu alfa.")
+} else {
+  cat("Strategia post hoc:", analysis$posthoc$strategy, "\n\n")
+  for (table_name in names(analysis$posthoc$tables)) {
+    cat("###", table_name, "\n\n")
+    print(knitr::kable(analysis$posthoc$tables[[table_name]], digits = 4))
+    cat("\n\n")
+  }
+}
+```
+
+## Diagnostyka modelu
+
+```{r}
+diagnostics_status <- analysis$diagnostics$status %>%
+  dplyr::mutate(
+    shapiro_resid_p = analysis$diagnostics$shapiro$p.value %||% NA_real_
+  )
+
+knitr::kable(diagnostics_status, digits = 4)
+```
+
+```{r}
+analysis$plots$diagnostics
+```
+
+## Wykresy
+
+```{r}
+analysis$plots$raw
+```
+
+```{r}
+analysis$plots$emm
+```

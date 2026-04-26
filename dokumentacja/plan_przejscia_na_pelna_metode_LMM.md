@@ -17,7 +17,7 @@ Model ma wykorzystywac wszystkie dostepne obserwacje niebrakujace dla danej zmie
 - Repo zawiera starsze szablony RM-ANOVA dla ukladu `3 grupy x 4 pomiary`.
 - Aktywny batch `2025-11/obliczenia_zbiorcze.Rmd` renderuje obecnie `szablon_anova_poprawiony_gemini.Rmd`, czyli raport oparty glownie na RM-ANOVA i kompletnych przypadkach.
 - Istnieje plik `szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R`, ktory jest blizszy metodzie z raportu, ale nie jest jeszcze w pelni gotowy:
-  - nie jest sledzony przez git,
+  - wymaga stabilizacji jako glowny modul analityczny,
   - nie laduje samodzielnie wymaganych pakietow/operatorow,
   - zawiera niedokonczony fragment diagnostyki wykresow,
   - nie jest wpiety w batch.
