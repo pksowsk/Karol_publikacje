@@ -1,0 +1,152 @@
+---
+title: "Obliczenia zbiorcze LMM"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    df-print: paged
+params:
+  data_path: "Dane/2025_11_23_publikacja.xlsx"
+  sheet: 1
+  output_dir: "raporty_batch/raporty_lmm"
+  render_reports: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+pipeline_candidates <- c(
+  "../szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R",
+  "szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R"
+)
+
+pipeline_path <- pipeline_candidates[file.exists(pipeline_candidates)][[1]]
+source(pipeline_path)
+
+data_path <- resolve_existing_path_2025_11(params$data_path)
+output_dir <- params$output_dir
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Dane i zmienne
+
+```{r}
+df_lmm <- load_2025_11_data(data_path, sheet = params$sheet)
+variables_to_analyze <- get_batch_variables_2025_11(df_lmm)
+
+cat("Plik danych:", data_path, "\n")
+cat("Liczba wierszy:", nrow(df_lmm), "\n")
+cat("Liczba uczestnikow:", dplyr::n_distinct(df_lmm$id_osoby), "\n")
+cat("Liczba zmiennych do analizy:", length(variables_to_analyze), "\n")
+```
+
+```{r}
+knitr::kable(tibble::tibble(variable = variables_to_analyze))
+```
+
+## Audyt transformacji
+
+```{r}
+transform_audit <- build_transform_audit_2025_11(df_lmm, variables_to_analyze)
+knitr::kable(transform_audit, digits = 4)
+```
+
+## Uruchomienie modeli LMM
+
+```{r}
+batch <- run_lmm_batch_2025_11(
+  data_path = data_path,
+  variables = variables_to_analyze,
+  sheet = params$sheet,
+  output_dir = output_dir,
+  write_workbook = TRUE
+)
+
+cat("Zapisano skoroszyt:", batch$workbook_file, "\n")
+```
+
+## Podsumowanie omnibus
+
+```{r}
+summary_display <- batch$tables$summary %>%
+  dplyr::mutate(
+    p_group_fmt = vapply(.data$p_group, fmt_p_2025_11, FUN.VALUE = character(1)),
+    p_time_fmt = vapply(.data$p_time, fmt_p_2025_11, FUN.VALUE = character(1)),
+    p_interaction_fmt = vapply(.data$p_interaction, fmt_p_2025_11, FUN.VALUE = character(1))
+  ) %>%
+  dplyr::select(
+    .data$variable,
+    .data$label,
+    .data$scale,
+    .data$n_obs,
+    .data$n_people,
+    .data$p_group_fmt,
+    .data$p_time_fmt,
+    .data$p_interaction_fmt,
+    .data$singular,
+    .data$status,
+    .data$error
+  )
+
+knitr::kable(summary_display)
+```
+
+## Bledy i ostrzezenia
+
+```{r}
+errors <- batch$tables$summary %>%
+  dplyr::filter(.data$status != "success" | !is.na(.data$error) | nzchar(.data$warnings))
+
+if (nrow(errors) == 0) {
+  cat("Brak bledow i ostrzezen wymagajacych uwagi.")
+} else {
+  knitr::kable(errors)
+}
+```
+
+## Render raportow jednostkowych
+
+```{r}
+if (isTRUE(params$render_reports)) {
+  report_template <- resolve_existing_path_2025_11(
+    "szablony_analiz/anova_rm/3gr_4pomiary/raport_lmm_2025_11.Rmd"
+  )
+
+  render_results <- lapply(variables_to_analyze, function(var) {
+    output_file <- paste0("raport_lmm_", var, ".html")
+
+    tryCatch({
+      rmarkdown::render(
+        input = report_template,
+        output_file = output_file,
+        output_dir = output_dir,
+        params = list(
+          variable = var,
+          data_path = data_path,
+          sheet = params$sheet
+        ),
+        envir = new.env(parent = globalenv()),
+        quiet = TRUE
+      )
+
+      tibble::tibble(variable = var, status = "success", file = file.path(output_dir, output_file), error = NA_character_)
+    }, error = function(e) {
+      tibble::tibble(variable = var, status = "error", file = NA_character_, error = conditionMessage(e))
+    })
+  })
+
+  render_results <- dplyr::bind_rows(render_results)
+  knitr::kable(render_results)
+} else {
+  cat("Render raportow jednostkowych pominiety. Ustaw params$render_reports = TRUE, aby wygenerowac HTML dla kazdej zmiennej.")
+}
+```
+
+## Pliki wynikowe
+
+```{r}
+cat("Katalog wynikow:", normalizePath(output_dir, mustWork = FALSE), "\n")
+cat("Skoroszyt Excel:", batch$workbook_file, "\n")
+```

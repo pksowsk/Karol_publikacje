@@ -45,6 +45,13 @@ Repo zostalo uporzadkowane tak, aby rozdzielic:
 
 ## Uwagi praktyczne
 
+- Nowy glowny workflow dla ukladu `3 grupy x 4 pomiary` jest oparty na LMM:
+  - pipeline: `szablony_analiz/anova_rm/3gr_4pomiary/lmm_pipeline_2025_11.R`,
+  - raport jednostkowy: `szablony_analiz/anova_rm/3gr_4pomiary/raport_lmm_2025_11.Rmd`,
+  - batch i eksport Excel: `2025-11/obliczenia_zbiorcze_LMM.Rmd`.
+  - manual metody: [`dokumentacja/LMM_manual.md`](dokumentacja/LMM_manual.md).
+  Uruchomienie batch:
+  `rmarkdown::render("2025-11/obliczenia_zbiorcze_LMM.Rmd")`.
 - `2025-11/obliczenia_zbiorcze.Rmd` zostal przepiety na szablon z `szablony_analiz/anova_rm/3gr_4pomiary/` oraz na katalog wynikow `2025-11/raporty_batch/raporty_anova/`.
 - Szablony w `szablony_analiz/anova_rm/3gr_2pomiary/`, `korelacje/` i `regresja/` zapisują nowe wyniki do `wyniki_robocze/`, zeby nie odtwarzac dawnego chaosu w katalogu glownym.
 - Czesc historycznych szablonow w `szablony_analiz/wykresy/` i `szablony_analiz/legacy/` nadal odwoluje sie do dawnych plikow danych, ktorych nie ma juz w repo. Te pliki zostaly zachowane jako material referencyjny, ale przed uruchomieniem wymagaja recznego wskazania danych.
